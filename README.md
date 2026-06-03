@@ -1,0 +1,154 @@
+# crypto-lob-stream
+
+Stream Binance Level 2 order book and trade data to local disk or Google Cloud Storage. Built for researchers and practitioners who need continuous, reconstructable LOB data and find it difficult to access this kind of dataset openly.
+
+Publishes quarterly snapshots to [Hugging Face](https://huggingface.co/) for free public use.
+
+---
+
+## Install
+
+```bash
+# Local output only
+pip install crypto-lob-stream
+
+# With GCS support
+pip install crypto-lob-stream[gcs]
+```
+
+Requires Python 3.10+.
+
+---
+
+## Quickstart
+
+### Python API
+
+```python
+from crypto_lob_stream import LOBStreamer
+
+# Stream to local disk
+streamer = LOBStreamer(
+    assets=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    output="local",
+    output_dir="./lob_data",
+)
+streamer.run()
+```
+
+```python
+# Stream to GCS
+streamer = LOBStreamer(
+    assets=["BTCUSDT"],
+    output="gcs",
+    bucket="my-gcs-bucket",
+)
+streamer.run()
+```
+
+```python
+# With a real-time callback on every trade
+def on_trade(record):
+    print(f"Trade: {record['asset']} {record['price']} x {record['quantity']}")
+
+streamer = LOBStreamer(
+    assets=["BTCUSDT"],
+    output="local",
+    on_trade=on_trade,
+)
+streamer.run()
+```
+
+### CLI
+
+```bash
+# Local
+crypto-lob-stream --assets BTCUSDT,ETHUSDT --output local --output-dir ./data
+
+# GCS
+crypto-lob-stream --assets BTCUSDT,ETHUSDT,SOLUSDT --output gcs --bucket my-bucket
+
+# Custom flush interval
+crypto-lob-stream --assets BTCUSDT --output local --flush-interval 60
+```
+
+---
+
+## Output structure
+
+```
+{output_dir}/
+  trades/{asset}/YYYY-MM-DD-HH.parquet
+  depth/{asset}/YYYY-MM-DD-HH.parquet
+  snapshots/{asset}/YYYY-MM-DD-HHmmss.parquet
+```
+
+All files are Snappy-compressed Parquet.
+
+---
+
+## Schemas
+
+### trades
+| Field | Type |
+|---|---|
+| timestamp_ms | int64 |
+| asset | string |
+| trade_id | int64 |
+| price | float64 |
+| quantity | float64 |
+| buyer_maker | bool |
+
+### depth (diff events)
+| Field | Type | Notes |
+|---|---|---|
+| timestamp_ms | int64 | |
+| asset | string | |
+| side | string (bid/ask) | |
+| price | float64 | |
+| quantity | float64 | 0.0 = level removed |
+| first_update_id | int64 | `U` field from Binance |
+| last_update_id | int64 | `u` field -- sequence number |
+
+### snapshots
+| Field | Type | Notes |
+|---|---|---|
+| timestamp_ms | int64 | |
+| asset | string | |
+| side | string (bid/ask) | |
+| price | float64 | |
+| quantity | float64 | |
+| last_update_id | int64 | Anchor point for diff replay |
+
+---
+
+## LOB reconstruction
+
+A REST snapshot is fetched and stored for every WebSocket connection (including reconnects). To reconstruct the book at any point in time:
+
+1. Load the nearest `snapshots/` file preceding your target window.
+2. Discard depth diff rows where `last_update_id <= snapshot.last_update_id`.
+3. Verify the first kept diff satisfies `first_update_id <= snapshot.last_update_id + 1`.
+4. Apply diffs in ascending `last_update_id` order. Remove levels where `quantity == 0.0`.
+
+---
+
+## LOBStreamer parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| assets | list[str] | required | Binance symbols, e.g. `["BTCUSDT"]` |
+| output | str | `"local"` | `"local"` or `"gcs"` |
+| output_dir | str | `"./lob_data"` | Base dir for local output |
+| bucket | str | None | GCS bucket (required for gcs output) |
+| fallback_dir | str | `"./lob_fallback"` | Local fallback if GCS fails |
+| flush_interval | int | `300` | Seconds between flushes |
+| on_trade | callable | None | Callback per trade record |
+| on_depth | callable | None | Callback per depth record |
+| log_dir | str | `"./logs"` | Rotating log directory |
+
+---
+
+## License
+
+MIT

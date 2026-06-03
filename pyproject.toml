@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-lob-stream"
+version = "0.1.0"
+description = "Stream Binance Level 2 order book and trade data to local disk or GCS."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["cryptocurrency", "order-book", "LOB", "binance", "market-data", "streaming"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core dependencies -- always installed
+dependencies = [
+    "websockets>=12.0",
+    "pyarrow>=14.0",
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Install with: pip install crypto-lob-stream[gcs]
+gcs = [
+    "google-cloud-storage>=2.0",
+]
+# Install everything
+all = [
+    "google-cloud-storage>=2.0",
+]
+
+[project.scripts]
+crypto-lob-stream = "crypto_lob_stream.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Goodie-Goody/crypto_lob_streamer"
+Repository = "https://github.com/Goodie-Goody/crypto_lob_streamer"
+Issues = "https://github.com/Goodie-Goody/crypto_lob_streamer/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["crypto_lob_stream*"]
