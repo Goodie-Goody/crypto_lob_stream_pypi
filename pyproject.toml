@@ -45,9 +45,9 @@ all = [
 crypto-lob-stream = "crypto_lob_stream.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/Goodie-Goody/crypto_lob_streamer"
-Repository = "https://github.com/Goodie-Goody/crypto_lob_streamer"
-Issues = "https://github.com/Goodie-Goody/crypto_lob_streamer/issues"
+Homepage = "https://github.com/Goodie-Goody/crypto_lob_stream_pypi"
+Repository = "https://github.com/Goodie-Goody/crypto_lob_stream_pypi"
+Issues = "https://github.com/Goodie-Goody/crypto_lob_stream_pypi/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
