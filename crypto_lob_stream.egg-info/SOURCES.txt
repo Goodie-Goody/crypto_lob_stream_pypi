@@ -1,9 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-crypto_lob_stream.egg-info/PKG-INFO
-crypto_lob_stream.egg-info/SOURCES.txt
-crypto_lob_stream.egg-info/dependency_links.txt
-crypto_lob_stream.egg-info/entry_points.txt
-crypto_lob_stream.egg-info/requires.txt
-crypto_lob_stream.egg-info/top_level.txt

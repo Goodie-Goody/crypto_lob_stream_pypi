@@ -1,2 +1,0 @@
-[console_scripts]
-crypto-lob-stream = crypto_lob_stream.cli:main
