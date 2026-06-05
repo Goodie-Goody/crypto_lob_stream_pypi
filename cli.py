@@ -1,68 +1,228 @@
 import argparse
 import sys
+from pathlib import Path
 
+from .config import (
+    apply_credentials,
+    check_gcs_connection,
+    get_saved_bucket,
+    load_config,
+    save_config,
+)
 from .streamer import LOBStreamer
 
+
+# ── Setup wizard ──────────────────────────────────────────────────────────────
+
+def run_setup():
+    """Interactive GCS setup wizard. Saves config to ~/.crypto_lob_stream/config.json."""
+    print("\ncrypto-lob-stream -- GCS Setup\n" + "-" * 34)
+
+    # Bucket name
+    existing_bucket = get_saved_bucket()
+    prompt = f"GCS bucket name [{existing_bucket}]: " if existing_bucket else "GCS bucket name: "
+    bucket = input(prompt).strip() or existing_bucket
+    if not bucket:
+        print("Error: bucket name is required.", file=sys.stderr)
+        sys.exit(1)
+
+    # Credentials path
+    existing_creds = load_config().get("gcs_credentials_path", "")
+    prompt = (
+        f"Path to service account JSON key [{existing_creds}]: "
+        if existing_creds
+        else "Path to service account JSON key: "
+    )
+    raw_path = input(prompt).strip() or existing_creds
+    if not raw_path:
+        print("Error: credentials path is required.", file=sys.stderr)
+        sys.exit(1)
+
+    resolved = Path(raw_path).expanduser().resolve()
+    if not resolved.exists():
+        print(f"Error: file not found: {resolved}", file=sys.stderr)
+        sys.exit(1)
+
+    # Save before testing so apply_credentials can find it
+    save_config({
+        "gcs_bucket":             bucket,
+        "gcs_credentials_path":   str(resolved),
+    })
+    print("\nSaved config to ~/.crypto_lob_stream/config.json")
+
+    # Test the connection
+    print(f"Testing connection to gs://{bucket} ...", end=" ", flush=True)
+    apply_credentials()
+    ok, msg = check_gcs_connection(bucket)
+    if ok:
+        print(f"OK\n\n{msg}")
+        print(
+            f"\nSetup complete. You can now run:\n\n"
+            f"  crypto-lob-stream --assets BTCUSDT,ETHUSDT --output gcs\n"
+        )
+    else:
+        print(f"FAILED\n\nConnection error: {msg}")
+        print(
+            "\nCredentials saved but connection test failed. "
+            "Check that the service account has Storage Object Admin on the bucket.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+# ── Show current config ───────────────────────────────────────────────────────
+
+def run_config():
+    """Print current saved configuration."""
+    cfg = load_config()
+    if not cfg:
+        print("No configuration saved yet. Run: crypto-lob-stream setup")
+        return
+    print("\nSaved configuration (~/.crypto_lob_stream/config.json):")
+    for k, v in cfg.items():
+        print(f"  {k}: {v}")
+    print()
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         prog="crypto-lob-stream",
-        description="Stream Binance order book and trade data to local disk or GCS.",
+        description="Stream Binance Level 2 order book and trade data to local disk or GCS.",
     )
-    parser.add_argument(
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # -- setup subcommand
+    subparsers.add_parser(
+        "setup",
+        help="Interactive GCS setup wizard -- run this once before streaming to GCS.",
+    )
+
+    # -- config subcommand
+    subparsers.add_parser(
+        "config",
+        help="Show current saved configuration.",
+    )
+
+    # -- stream subcommand (default behaviour)
+    stream_parser = subparsers.add_parser(
+        "stream",
+        help="Start streaming (default command).",
+    )
+    _add_stream_args(stream_parser)
+
+    # Also attach stream args directly to the root parser so users can run
+    # `crypto-lob-stream --assets BTCUSDT` without typing `stream` explicitly.
+    _add_stream_args(parser)
+
+    args = parser.parse_args()
+
+    if args.command == "setup":
+        run_setup()
+        return
+
+    if args.command == "config":
+        run_config()
+        return
+
+    # Default: stream
+    _run_stream(args)
+
+
+def _add_stream_args(p: argparse.ArgumentParser):
+    p.add_argument(
         "--assets",
-        required=True,
-        help="Comma-separated list of Binance symbols, e.g. BTCUSDT,ETHUSDT,SOLUSDT",
+        default=None,
+        help="Comma-separated Binance symbols, e.g. BTCUSDT,ETHUSDT,SOLUSDT",
     )
-    parser.add_argument(
+    p.add_argument(
         "--output",
         choices=["local", "gcs"],
         default="local",
         help="Output target (default: local)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--output-dir",
         default="./lob_data",
         help="Base directory for local output (default: ./lob_data)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--bucket",
         default=None,
-        help="GCS bucket name (required when --output=gcs)",
+        help=(
+            "GCS bucket name. If omitted, uses bucket saved by `setup`. "
+            "Required when --output=gcs and no saved config exists."
+        ),
     )
-    parser.add_argument(
+    p.add_argument(
+        "--credentials",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to GCS service account JSON key. "
+            "If omitted, uses path saved by `setup` or GOOGLE_APPLICATION_CREDENTIALS."
+        ),
+    )
+    p.add_argument(
         "--fallback-dir",
         default="./lob_fallback",
         help="Local fallback directory for failed GCS uploads (default: ./lob_fallback)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--flush-interval",
         type=int,
         default=300,
         help="Seconds between buffer flushes (default: 300)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--log-dir",
         default="./logs",
         help="Directory for rotating log files (default: ./logs)",
     )
 
-    args = parser.parse_args()
+
+def _run_stream(args):
+    # Validate assets
+    if not getattr(args, "assets", None):
+        print(
+            "Error: --assets is required.\n"
+            "Example: crypto-lob-stream --assets BTCUSDT,ETHUSDT",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     assets = [a.strip() for a in args.assets.split(",") if a.strip()]
     if not assets:
         print("Error: --assets must contain at least one symbol.", file=sys.stderr)
         sys.exit(1)
 
-    if args.output == "gcs" and not args.bucket:
-        print("Error: --bucket is required when --output=gcs.", file=sys.stderr)
-        sys.exit(1)
+    # Resolve GCS settings
+    bucket = getattr(args, "bucket", None) or get_saved_bucket()
+    credentials = getattr(args, "credentials", None)
+
+    if args.output == "gcs":
+        if not bucket:
+            print(
+                "Error: no GCS bucket specified.\n"
+                "Either run `crypto-lob-stream setup` first, "
+                "or pass --bucket YOUR_BUCKET_NAME.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Apply credentials (explicit flag > saved config > env var)
+        try:
+            apply_credentials(credentials)
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     streamer = LOBStreamer(
         assets=assets,
         output=args.output,
         output_dir=args.output_dir,
-        bucket=args.bucket,
+        bucket=bucket,
         fallback_dir=args.fallback_dir,
         flush_interval=args.flush_interval,
         log_dir=args.log_dir,

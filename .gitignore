@@ -1,0 +1,39 @@
+# Environment
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Logs
+*.log
+logs/
+
+# Data -- never commit parquet files or local stream output
+*.parquet
+lob_data/
+lob_fallback/
+
+# GCS credentials -- never commit
+*.json
+!pyproject.toml
+
+# Package config saved by setup wizard
+.crypto_lob_stream/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
