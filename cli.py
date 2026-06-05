@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -10,6 +11,23 @@ from .config import (
     save_config,
 )
 from .streamer import LOBStreamer
+
+
+def _check_path_warning():
+    """Warn Windows users if the Scripts directory is not on PATH."""
+    if sys.platform != "win32":
+        return
+    scripts_dir = Path(sys.executable).parent / "Scripts"
+    path_dirs = [Path(p) for p in os.environ.get("PATH", "").split(os.pathsep)]
+    if scripts_dir not in path_dirs:
+        print(
+            f"\nNote: {scripts_dir} is not on your PATH.\n"
+            f"To use 'crypto-lob-stream' directly in future, add it:\n\n"
+            f"  [System Settings > Environment Variables > Path > New]\n"
+            f"  Add: {scripts_dir}\n\n"
+            f"For now, run with: python -m crypto_lob_stream.cli\n",
+            file=sys.stderr,
+        )
 
 
 # ── Setup wizard ──────────────────────────────────────────────────────────────
@@ -87,6 +105,7 @@ def run_config():
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def main():
+    _check_path_warning()
     parser = argparse.ArgumentParser(
         prog="crypto-lob-stream",
         description="Stream Binance Level 2 order book and trade data to local disk or GCS.",

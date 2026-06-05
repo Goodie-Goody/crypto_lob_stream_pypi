@@ -18,6 +18,8 @@ pip install crypto-lob-stream[gcs]
 
 Requires Python 3.10+.
 
+**Windows users:** if you see a warning that the `Scripts` directory is not on PATH, add it via System Settings > Environment Variables > Path. Until then, run with `python -m crypto_lob_stream.cli` instead of `crypto-lob-stream`.
+
 ---
 
 ## Quickstart
