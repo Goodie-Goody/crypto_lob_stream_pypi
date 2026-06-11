@@ -238,7 +238,12 @@ class LOBStreamer:
             return
 
         ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
+        flush_time = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
         for asset in self.assets:
+            trades_saved = 0
+            depth_saved = 0
+
             if self._trade_buffer[asset]:
                 records = self._trade_buffer[asset][:]
                 success = True
@@ -252,6 +257,7 @@ class LOBStreamer:
                         fallback_dir=self.fallback_dir,
                     )
                 if success:
+                    trades_saved = len(records)
                     self._trade_buffer[asset] = []
 
             if self._depth_buffer[asset]:
@@ -267,7 +273,15 @@ class LOBStreamer:
                         fallback_dir=self.fallback_dir,
                     )
                 if success:
+                    depth_saved = len(records)
                     self._depth_buffer[asset] = []
+
+            if trades_saved or depth_saved:
+                print(
+                    f"[{flush_time}] {asset.upper():10s} "
+                    f"trades: {trades_saved:>7,} | "
+                    f"depth events: {depth_saved:>9,} | saved"
+                )
 
         self._last_flush = now
 
@@ -298,14 +312,7 @@ class LOBStreamer:
 
                     async def heartbeat():
                         while True:
-                            await asyncio.sleep(300)
-                            for a in self.assets:
-                                t = len(self._trade_buffer[a])
-                                d = len(self._depth_buffer[a])
-                                logger.info(
-                                    f"Heartbeat {a.upper()} -- "
-                                    f"trades: {t:,} | depth: {d:,}"
-                                )
+                            await asyncio.sleep(self.flush_interval)
                             self._flush()
 
                     heartbeat_task = asyncio.create_task(heartbeat())
@@ -345,4 +352,7 @@ class LOBStreamer:
         else:
             logger.info(f"Bucket  : {self.bucket}")
         logger.info(f"Flush   : {self.flush_interval}s")
-        asyncio.run(self._stream())
+        try:
+            asyncio.run(self._stream())
+        except KeyboardInterrupt:
+            print("\nStopped. Final buffers flushed.")
