@@ -310,7 +310,6 @@ Config is saved to `~/.crypto_lob_stream/config.json`, so credentials apply auto
 
 ## Known limitations
 
-- Binance depth files collected before **2026-06-03 14:38:49 UTC** do not contain sequence ids and cannot be used for full reconstruction.
 - `okx_swap` funding records have `mark_price=None` by design — a real value requires also subscribing to OKX's separate `mark-price` channel, which isn't wired up yet.
 - Auto-resync-on-gap only works for REST-snapshot exchanges (Binance, Binance Futures). OKX/Bybit-family exchanges log and record the gap but need a full reconnect to get a fresh socket-delivered snapshot.
 - A genuine exchange-side gap hasn't yet been observed in live testing; the detection logic itself is validated via synthetic/mocked sequence breaks (`tests/test_integration_mocked.py`).
