@@ -28,8 +28,9 @@ Normalised record shapes (what the streamer expects back):
 """
 
 import time
+import zlib
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional, Tuple
 
 
 class Exchange(ABC):
@@ -41,6 +42,20 @@ class Exchange(ABC):
     # the full order book snapshot as a single frame that exceeds the
     # websockets library default of 1 MB. None means use the library default.
     ws_max_size = None
+
+    # True when first_update_id/last_update_id on depth records are real
+    # exchange-assigned sequence numbers that should chain message-to-message
+    # (Binance U/u, Bybit seq/u, OKX prevSeqId/seqId). False when they're a
+    # message-timestamp placeholder with no real continuity invariant
+    # (Coinbase, Kraken currently use the message time for both fields).
+    # LOBStreamer's gap detector only runs for exchanges where this is True;
+    # running it against a timestamp placeholder would just detect "the
+    # clock moved", which isn't a gap.
+    has_sequence_ids: bool = True
+
+    # True when this adapter implements live order-book checksum
+    # verification (see KrakenExchange below for the only current example).
+    supports_checksum: bool = False
 
     # -- Connection --------------------------------------------------------
 
@@ -93,6 +108,24 @@ class Exchange(ABC):
     def socket_snapshot_asset(self, raw: dict) -> str:
         """Return the asset symbol for a socket-delivered snapshot message."""
         return raw.get("product_id", "").upper()
+
+    # -- Optional auxiliary connection --------------------------------------
+
+    # Optional second WebSocket connection, for exchanges where some
+    # streams must be routed separately from the main one (currently used
+    # by BinanceFuturesExchange -- see its docstring). Returning None
+    # (default) means no auxiliary connection is needed.
+    def aux_ws_url(self, assets: List[str]) -> Optional[str]:
+        return None
+
+    def aux_subscribe_messages(self, assets: List[str]) -> List[dict]:
+        return []
+
+    def parse_aux_message(self, raw: dict) -> List[dict]:
+        """Parse a message arriving on the auxiliary connection. Defaults
+        to the same parser as the main connection; override only if the
+        aux connection needs different handling."""
+        return self.parse_message(raw)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -220,6 +253,11 @@ class CoinbaseExchange(Exchange):
     """
 
     name = "coinbase"
+
+    # l2update has no real exchange sequence number -- first/last_update_id
+    # are both set to the message timestamp (see parse_message). Gap
+    # detection against that would be meaningless, so it's disabled here.
+    has_sequence_ids = False
 
     # Coinbase level2 snapshots for liquid pairs exceed the 1 MB default.
     # Allow up to 16 MB frames.
@@ -491,6 +529,76 @@ class OKXExchange(Exchange):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# OKX -- USDT-margined perpetual swaps
+# ──────────────────────────────────────────────────────────────────────────
+
+class OKXSwapExchange(OKXExchange):
+    """
+    OKX v5 public WebSocket feed for USDT-margined perpetual swaps (instId
+    suffix "-SWAP", e.g. BTC-USDT-SWAP). Same public endpoint, same
+    `books`/`trades` channels and message shapes as spot OKX -- just a
+    different instId -- plus an added `funding-rate` channel for a
+    "funding" record type (matching binance_futures).
+
+    Differences from OKXExchange (spot):
+      - normalize_symbol appends "-SWAP" to the spot-style instId.
+      - subscribe_messages additionally subscribes to `funding-rate` for
+        each instId.
+      - parse_message handles `funding-rate` messages.
+
+    mark_price is NOT populated here (left as None). OKX's `funding-rate`
+    channel (fields confirmed via OKX's own SDK source: fundingRate,
+    fundingTime, nextFundingRate, nextFundingTime) doesn't include a mark
+    price -- getting one would mean also subscribing to OKX's separate
+    `mark-price` channel, whose exact push field name wasn't confirmed
+    from documentation in the time available (today already had two
+    bugs -- Kraken's checksum truncation, Binance's routed-path split --
+    that started as a confident-looking guess from docs alone, so this is
+    left as a documented gap rather than a third one). funding_rate and
+    next_funding_ms are solid; mark_price is None for this exchange until
+    that's verified. Recommend validating against a live connection.
+    """
+
+    name = "okx_swap"
+
+    def normalize_symbol(self, symbol: str) -> str:
+        base = super().normalize_symbol(symbol)
+        return base if base.endswith("-SWAP") else f"{base}-SWAP"
+
+    def subscribe_messages(self, assets: List[str]) -> List[dict]:
+        args = []
+        for a in assets:
+            inst = self.normalize_symbol(a)
+            args.append({"channel": "books", "instId": inst})
+            args.append({"channel": "trades", "instId": inst})
+            args.append({"channel": "funding-rate", "instId": inst})
+        return [{"op": "subscribe", "args": args}]
+
+    def parse_message(self, raw: dict) -> List[dict]:
+        arg = raw.get("arg", {})
+        channel = arg.get("channel", "")
+
+        if channel == "funding-rate":
+            data = raw.get("data", [])
+            out = []
+            for d in data:
+                try:
+                    out.append({
+                        "type":            "funding",
+                        "asset":           d.get("instId", arg.get("instId", "")).upper(),
+                        "timestamp_ms":    int(d.get("ts", time.time() * 1000)),
+                        "mark_price":      None,
+                        "funding_rate":    float(d["fundingRate"]),
+                        "next_funding_ms": int(d["nextFundingTime"]),
+                    })
+                except (ValueError, TypeError, KeyError):
+                    continue
+            return out
+
+        return super().parse_message(raw)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Kraken (v2 public WebSocket)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -516,6 +624,29 @@ class KrakenExchange(Exchange):
     name = "kraken"
     ws_max_size = 16 * 1024 * 1024
 
+    # Kraken v2 book updates have no Binance-style sequence id -- the
+    # message timestamp is used for both first/last_update_id (see
+    # parse_message), so there's no real continuity invariant to check.
+    # checksum verification (below) is the meaningful integrity check here.
+    has_sequence_ids = False
+    supports_checksum = True
+
+    def __init__(self):
+        # Live top-of-book mirror per asset, maintained only when checksum
+        # verification is active: {asset: {"bid": {price: (price_str, qty_str)},
+        #                                   "ask": {price: (price_str, qty_str)}}}
+        # Keeping the original price/qty strings (not just floats) matters --
+        # Kraken's checksum format is sensitive to exact digit formatting
+        # (e.g. "65000.10" vs "65000.1" produce different checksums after
+        # the decimal point is stripped), which a float round-trip would
+        # lose. See verify_checksum() and LOBStreamer's json.loads call.
+        self._books = {}
+        # Must match the "depth" sent in subscribe_messages() -- Kraken
+        # doesn't send explicit qty:0 removals for levels that fall out of
+        # your subscribed depth (only for in-scope removals), so the local
+        # mirror has to be truncated to the same depth itself.
+        self._book_depth = 25
+
     def ws_url(self, assets: List[str]) -> str:
         return "wss://ws.kraken.com/v2"
 
@@ -523,7 +654,7 @@ class KrakenExchange(Exchange):
         symbols = [self.normalize_symbol(a) for a in assets]
         return [
             {"method": "subscribe",
-             "params": {"channel": "book", "symbol": symbols, "depth": 25}},
+             "params": {"channel": "book", "symbol": symbols, "depth": self._book_depth}},
             {"method": "subscribe",
              "params": {"channel": "trade", "symbol": symbols}},
         ]
@@ -646,6 +777,104 @@ class KrakenExchange(Exchange):
             })
         return records
 
+    # -- Checksum verification (optional, off by default) ------------------
+    #
+    # Implements Kraken's documented v2 book-checksum algorithm:
+    #   1. Take the best 10 ask levels (ascending price) and best 10 bid
+    #      levels (descending price) of the live book.
+    #   2. For each level's price and quantity: remove the decimal point,
+    #      then strip leading zeros from the resulting digit string.
+    #   3. Concatenate price+qty for all 10 asks, then all 10 bids, in that
+    #      order, into one string.
+    #   4. CRC32 the ASCII bytes of that string; compare to the integer
+    #      "checksum" field Kraken sends on each book snapshot/update.
+    #
+    # This is implemented from Kraken's public docs, not verified against a
+    # live connection from inside this environment -- the algorithm's
+    # formatting edge cases (e.g. whole-number quantities, very small
+    # prices) are exactly the kind of detail that's easy to get subtly
+    # wrong from documentation alone. Treat the first live run as the real
+    # test: LOBStreamer logs every computed-vs-received pair at DEBUG level
+    # and writes mismatches to the checksum log, so a systematic mismatch
+    # (rather than an occasional one) will be obvious immediately and
+    # almost certainly means the format above needs adjusting, not that
+    # the book itself is actually wrong.
+
+    @staticmethod
+    def _fmt_num(raw_value) -> str:
+        """Kraken checksum number formatting: strip '.', then leading zeros."""
+        s = str(raw_value)
+        if "." in s:
+            whole, frac = s.split(".", 1)
+        else:
+            whole, frac = s, ""
+        digits = (whole + frac).lstrip("0")
+        return digits or "0"
+
+    def update_book_and_checksum(
+        self, book: dict, is_snapshot: bool
+    ) -> Tuple[Optional[str], Optional[bool], Optional[int], Optional[int]]:
+        """
+        Apply a Kraken v2 `book` channel payload (one element of the
+        message's "data" list, snapshot or update) to this exchange's live
+        per-asset book mirror, and verify the embedded checksum if present.
+
+        Returns (asset, match, expected, received). `match` is None when
+        the payload carries no "checksum" field (shouldn't normally happen
+        on Kraken's book channel, but defensive).
+        """
+        asset = book.get("symbol", "").upper()
+        if not asset:
+            return None, None, None, None
+
+        state = self._books.setdefault(asset, {"bid": {}, "ask": {}})
+        if is_snapshot:
+            state["bid"] = {}
+            state["ask"] = {}
+
+        for side_key, wire_key in (("bid", "bids"), ("ask", "asks")):
+            for lvl in book.get(wire_key, []):
+                price_str = str(lvl["price"])
+                qty_str = str(lvl["qty"])
+                price = float(price_str)
+                if float(qty_str) == 0:
+                    state[side_key].pop(price, None)
+                else:
+                    state[side_key][price] = (price_str, qty_str)
+
+        # Kraken's docs are explicit that levels falling out of your
+        # subscribed depth (not just the top 10 used for the checksum) are
+        # NOT announced with an explicit qty:0 -- you're expected to
+        # truncate locally. Without this, the mirror accumulates stale
+        # deep levels indefinitely. depth defaults to 25 in
+        # subscribe_messages(); truncate to the same value here.
+        for side_key in ("bid", "ask"):
+            if len(state[side_key]) > self._book_depth:
+                ordered = sorted(
+                    state[side_key].items(), reverse=(side_key == "bid")
+                )
+                state[side_key] = dict(ordered[: self._book_depth])
+
+        received = book.get("checksum")
+        if received is None:
+            return asset, None, None, None
+
+        asks_top = sorted(state["ask"].items())[:10]            # ascending
+        bids_top = sorted(state["bid"].items(), reverse=True)[:10]  # descending
+
+        parts = []
+        for _, (price_str, qty_str) in asks_top:
+            parts.append(self._fmt_num(price_str))
+            parts.append(self._fmt_num(qty_str))
+        for _, (price_str, qty_str) in bids_top:
+            parts.append(self._fmt_num(price_str))
+            parts.append(self._fmt_num(qty_str))
+
+        payload = "".join(parts)
+        expected = zlib.crc32(payload.encode("ascii"))
+        received_int = int(received)
+        return asset, (expected == received_int), expected, received_int
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Bybit (v5 public spot WebSocket)
@@ -660,7 +889,9 @@ class BybitExchange(Exchange):
         like "orderbook.50.BTCUSDT" and "publicTrade.BTCUSDT".
       - The orderbook topic sends type="snapshot" first, then type="delta".
         Bids/asks are [price, qty] arrays; qty "0" removes a level. Bybit
-        provides a real update id `u` and `seq`, used as the ordering key.
+        provides a real per-symbol update id `u`, used as the ordering key
+        (NOT `seq`, a different "cross sequence" counter on an unrelated
+        scale -- see the comment in parse_message for why that matters).
       - The publicTrade topic sends trade arrays (type snapshot or delta;
         both carry trade data and are treated identically).
       - Symbol format is concatenated, e.g. BTCUSDT.
@@ -718,8 +949,21 @@ class BybitExchange(Exchange):
             data = raw.get("data", {})
             asset = data.get("s", "").upper()
             ts = int(raw.get("ts", 0))
+            # "u" is the real per-symbol update counter and the correct
+            # continuity id -- it's what parse_snapshot() seeds
+            # last_update_id from too. "seq" is a *different* counter
+            # ("cross sequence") that Bybit's own docs describe as being
+            # for comparing freshness across different data sources (e.g.
+            # REST vs WS), not a chainable per-message id -- it's on a
+            # completely different numeric scale (tens of billions vs u's
+            # hundreds of millions). An earlier version of this method
+            # used seq for first_update_id, which meant the gap detector
+            # was comparing two unrelated counters and reported a "gap"
+            # on essentially every message; caught via a live run showing
+            # thousands of gap events in under a minute, each with mismatched
+            # orders of magnitude between expected/received -- a real gap
+            # looks like a small jump, not 12 orders of magnitude.
             uid = int(data.get("u", ts))
-            seq = int(data.get("seq", uid))
             out = []
             for price, qty in data.get("b", []):
                 out.append({
@@ -729,7 +973,7 @@ class BybitExchange(Exchange):
                     "side":            "bid",
                     "price":           float(price),
                     "quantity":        float(qty),
-                    "first_update_id": seq,
+                    "first_update_id": uid,
                     "last_update_id":  uid,
                 })
             for price, qty in data.get("a", []):
@@ -740,7 +984,7 @@ class BybitExchange(Exchange):
                     "side":            "ask",
                     "price":           float(price),
                     "quantity":        float(qty),
-                    "first_update_id": seq,
+                    "first_update_id": uid,
                     "last_update_id":  uid,
                 })
             return out
@@ -794,15 +1038,203 @@ class BybitExchange(Exchange):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Bybit -- USDT-margined linear perpetuals
+# ──────────────────────────────────────────────────────────────────────────
+
+class BybitLinearExchange(BybitExchange):
+    """
+    Bybit v5 public WebSocket feed for USDT-margined linear perpetuals --
+    same orderbook/trade message shapes as Bybit spot, just a different
+    host (wss://stream.bybit.com/v5/public/linear vs /spot) -- plus an
+    added `tickers.<symbol>` topic for a "funding" record type (matching
+    binance_futures).
+
+    Confirmed via docs (and a real sample payload): Bybit's linear tickers
+    message bundles markPrice, fundingRate, and nextFundingTime into one
+    push -- unlike OKX, which splits these across two channels -- so
+    mark_price IS populated here, unlike the OKX swap adapter.
+
+    The first tickers message per symbol is a full snapshot; subsequent
+    "delta" messages may omit fields that haven't changed since the last
+    push. A funding record is only emitted when markPrice, fundingRate,
+    and nextFundingTime are all present on that particular message, so
+    expect fewer funding records than a channel that always re-sends
+    everything -- at least one per snapshot, typically more.
+    """
+
+    name = "bybit_linear"
+
+    def ws_url(self, assets: List[str]) -> str:
+        return "wss://stream.bybit.com/v5/public/linear"
+
+    def subscribe_messages(self, assets: List[str]) -> List[dict]:
+        args = []
+        for a in assets:
+            sym = self.normalize_symbol(a)
+            args.append(f"orderbook.50.{sym}")
+            args.append(f"publicTrade.{sym}")
+            args.append(f"tickers.{sym}")
+        return [{"op": "subscribe", "args": args}]
+
+    def parse_message(self, raw: dict) -> List[dict]:
+        topic = raw.get("topic", "")
+
+        if topic.startswith("tickers."):
+            data = raw.get("data", {})
+            required = {"markPrice", "fundingRate", "nextFundingTime"}
+            if not required.issubset(data):
+                return []
+            try:
+                return [{
+                    "type":            "funding",
+                    "asset":           data.get("symbol", "").upper(),
+                    "timestamp_ms":    int(raw.get("ts", time.time() * 1000)),
+                    "mark_price":      float(data["markPrice"]),
+                    "funding_rate":    float(data["fundingRate"]),
+                    "next_funding_ms": int(data["nextFundingTime"]),
+                }]
+            except (ValueError, TypeError, KeyError):
+                return []
+
+        return super().parse_message(raw)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Binance USDⓢ-M Futures (perpetuals) -- public WebSocket
+# ──────────────────────────────────────────────────────────────────────────
+
+class BinanceFuturesExchange(BinanceExchange):
+    """
+    Binance USDⓢ-M Futures public WebSocket feed (fstream.binance.com).
+
+    NEW, and the least battle-tested adapter in this file -- spot trade/depth
+    message shapes carry over almost unchanged, but this has not been run
+    against a live connection from inside this environment. Differences
+    from BinanceExchange (spot) implemented here:
+
+      - Different hosts: wss://fstream.binance.com for the socket,
+        https://fapi.binance.com for REST snapshots (vs stream.binance.com /
+        api.binance.com for spot).
+      - Futures depth diffs carry an extra "pu" (previous final update id)
+        field, which Binance's futures docs specify as the correct
+        continuity anchor (each event's pu should equal the prior event's
+        u). It's mapped to first_update_id here so it works unchanged
+        through the existing gap detector, which already checks
+        first_update_id against the previous last_update_id.
+      - A markPrice@1s stream provides funding rate / mark price, producing
+        a new "funding" record type that no spot exchange in this file
+        emits (routed to its own buffer/Parquet table -- FUNDING_SCHEMA in
+        schemas.py). Binance recently split its WebSocket infrastructure
+        into /public, /market, and /private routed paths; a connection
+        without one of those paths in the URL only receives /public stream
+        data, and markPrice is a /market stream -- it's silently dropped
+        rather than erroring, which makes this easy to miss. trade/depth
+        are /public and work fine on the plain, unrouted connection (the
+        one ws_url() below builds), so markPrice is fetched over a second,
+        /market-routed connection instead (aux_ws_url() below). This was
+        caught by an actual live run silently producing zero funding
+        records despite the package running with no errors -- worth
+        knowing if this Binance behaviour changes again.
+      - Contract symbols (e.g. BTCUSDT perpetual vs BTCUSDT spot) happen to
+        share the same string for the common perpetual contracts, so
+        normalize_symbol is inherited unchanged from BinanceExchange. This
+        will NOT hold for dated/quarterly futures contracts (e.g.
+        BTCUSDT_250926), which aren't handled by this adapter.
+
+    Recommend validating against a live connection -- and against a couple
+    of different contracts -- before relying on this for research data.
+    """
+
+    name = "binance_futures"
+
+    def ws_url(self, assets: List[str]) -> str:
+        streams = []
+        for asset in assets:
+            a = asset.lower()
+            streams.append(f"{a}@trade")
+            streams.append(f"{a}@depth@100ms")
+        return f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+
+    def aux_ws_url(self, assets: List[str]) -> str:
+        streams = [f"{a.lower()}@markPrice@1s" for a in assets]
+        return f"wss://fstream.binance.com/market/stream?streams={'/'.join(streams)}"
+
+    def parse_message(self, raw: dict) -> List[dict]:
+        stream_name = raw.get("stream", "")
+        data = raw.get("data", {})
+        if not stream_name:
+            return []
+        asset = stream_name.split("@")[0].upper()
+
+        if "@markPrice" in stream_name:
+            required = {"E", "p", "r", "T"}
+            if not required.issubset(data):
+                return []
+            return [{
+                "type":            "funding",
+                "asset":           asset,
+                "timestamp_ms":    int(data["E"]),
+                "mark_price":      float(data["p"]),
+                "funding_rate":    float(data["r"]),
+                "next_funding_ms": int(data["T"]),
+            }]
+
+        if "@depth" in stream_name:
+            required = {"U", "u", "b", "a"}
+            if not required.issubset(data):
+                return []
+            ts = int(time.time() * 1000)
+            # Futures continuity anchor is "pu" (previous final update id),
+            # not "U" -- fall back to U if a futures-style message is ever
+            # missing it, but pu is what Binance's docs say to chain on.
+            first_uid = int(data.get("pu", data["U"]))
+            last_uid = int(data["u"])
+            out = []
+            for price, qty in data["b"]:
+                out.append({
+                    "type":            "depth",
+                    "asset":           asset,
+                    "timestamp_ms":    ts,
+                    "side":            "bid",
+                    "price":           float(price),
+                    "quantity":        float(qty),
+                    "first_update_id": first_uid,
+                    "last_update_id":  last_uid,
+                })
+            for price, qty in data["a"]:
+                out.append({
+                    "type":            "depth",
+                    "asset":           asset,
+                    "timestamp_ms":    ts,
+                    "side":            "ask",
+                    "price":           float(price),
+                    "quantity":        float(qty),
+                    "first_update_id": first_uid,
+                    "last_update_id":  last_uid,
+                })
+            return out
+
+        # "@trade" falls through to BinanceExchange's handling unchanged --
+        # the spot and futures trade payload shapes match.
+        return super().parse_message(raw)
+
+    def snapshot_url(self, asset: str) -> str:
+        return f"https://fapi.binance.com/fapi/v1/depth?symbol={asset.upper()}&limit=1000"
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Registry
 # ──────────────────────────────────────────────────────────────────────────
 
 _EXCHANGES = {
     "binance": BinanceExchange,
+    "binance_futures": BinanceFuturesExchange,
     "coinbase": CoinbaseExchange,
     "okx": OKXExchange,
+    "okx_swap": OKXSwapExchange,
     "kraken": KrakenExchange,
     "bybit": BybitExchange,
+    "bybit_linear": BybitLinearExchange,
 }
 
 

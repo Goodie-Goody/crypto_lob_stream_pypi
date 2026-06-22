@@ -52,29 +52,30 @@ def test_assets_normalized_binance():
 
 def test_ingest_trade():
     s = LOBStreamer(assets=["BTCUSDT"], output="local")
-    s._ingest({
+    s._ingest("binance", s.exchange, {
         "type": "trade", "asset": "BTCUSDT", "timestamp_ms": 1700000000000,
         "trade_id": 123456, "price": 65000.0, "quantity": 0.01, "buyer_maker": False,
     })
-    assert len(s._trade_buffer["BTCUSDT"]) == 1
-    assert s._trade_buffer["BTCUSDT"][0]["price"] == 65000.0
+    assert len(s._trade_buffer["binance:BTCUSDT"]) == 1
+    assert s._trade_buffer["binance:BTCUSDT"][0]["price"] == 65000.0
+    assert s._trade_buffer["binance:BTCUSDT"][0]["exchange"] == "binance"
 
 
 def test_ingest_depth():
     s = LOBStreamer(assets=["BTCUSDT"], output="local")
-    s._ingest({
+    s._ingest("binance", s.exchange, {
         "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1700000000000,
         "side": "bid", "price": 65000.0, "quantity": 0.5,
         "first_update_id": 1000, "last_update_id": 1005,
     })
-    assert len(s._depth_buffer["BTCUSDT"]) == 1
-    assert s._depth_buffer["BTCUSDT"][0]["last_update_id"] == 1005
+    assert len(s._depth_buffer["binance:BTCUSDT"]) == 1
+    assert s._depth_buffer["binance:BTCUSDT"][0]["last_update_id"] == 1005
 
 
 def test_on_trade_callback():
     received = []
     s = LOBStreamer(assets=["BTCUSDT"], output="local", on_trade=received.append)
-    s._ingest({
+    s._ingest("binance", s.exchange, {
         "type": "trade", "asset": "BTCUSDT", "timestamp_ms": 1700000000000,
         "trade_id": 1, "price": 100.0, "quantity": 1.0, "buyer_maker": True,
     })
@@ -85,13 +86,221 @@ def test_on_trade_callback():
 def test_on_depth_callback():
     received = []
     s = LOBStreamer(assets=["BTCUSDT"], output="local", on_depth=received.append)
-    s._ingest({
+    s._ingest("binance", s.exchange, {
         "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1700000000000,
         "side": "bid", "price": 100.0, "quantity": 1.0,
         "first_update_id": 1, "last_update_id": 2,
     })
     assert len(received) == 1
     assert received[0]["side"] == "bid"
+
+
+# ── Multi-exchange feeds ─────────────────────────────────────────────────────
+
+def test_multi_exchange_feeds_built():
+    s = LOBStreamer(
+        exchanges=[
+            {"exchange": "binance", "assets": ["BTCUSDT", "ETHUSDT"]},
+            {"exchange": "kraken", "assets": ["BTC/USD"]},
+        ],
+        output="local",
+    )
+    assert len(s.feeds) == 2
+    names = sorted(f.exchange.name for f in s.feeds)
+    assert names == ["binance", "kraken"]
+    binance_feed = next(f for f in s.feeds if f.exchange.name == "binance")
+    assert binance_feed.assets == ["BTCUSDT", "ETHUSDT"]
+    # Backward-compat single-exchange attrs reflect the first feed
+    assert s.exchange.name == "binance"
+    assert s.assets == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_multi_exchange_requires_assets_per_entry():
+    with pytest.raises(ValueError, match="no assets"):
+        LOBStreamer(exchanges=[{"exchange": "binance", "assets": []}], output="local")
+
+
+def test_multi_exchange_buffers_dont_collide():
+    s = LOBStreamer(
+        exchanges=[
+            {"exchange": "binance", "assets": ["BTCUSDT"]},
+            {"exchange": "bybit", "assets": ["BTCUSDT"]},
+        ],
+        output="local",
+    )
+    binance_exch = next(f.exchange for f in s.feeds if f.exchange.name == "binance")
+    bybit_exch = next(f.exchange for f in s.feeds if f.exchange.name == "bybit")
+    s._ingest("binance", binance_exch, {
+        "type": "trade", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "trade_id": 1, "price": 1.0, "quantity": 1.0, "buyer_maker": False,
+    })
+    s._ingest("bybit", bybit_exch, {
+        "type": "trade", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "trade_id": 2, "price": 2.0, "quantity": 1.0, "buyer_maker": False,
+    })
+    assert len(s._trade_buffer["binance:BTCUSDT"]) == 1
+    assert len(s._trade_buffer["bybit:BTCUSDT"]) == 1
+    assert s._trade_buffer["binance:BTCUSDT"][0]["price"] == 1.0
+    assert s._trade_buffer["bybit:BTCUSDT"][0]["price"] == 2.0
+
+
+# ── Gap detection ────────────────────────────────────────────────────────────
+
+def test_gap_detected_on_sequence_break():
+    s = LOBStreamer(assets=["BTCUSDT"], output="local", resync_on_gap=False)
+    exch = s.exchange  # binance, has_sequence_ids=True
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 100, "last_update_id": 110,
+    })
+    # Next message should start at 111; it starts at 115 instead -> gap of 4
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 2,
+        "side": "ask", "price": 2.0, "quantity": 1.0,
+        "first_update_id": 115, "last_update_id": 120,
+    })
+    gaps = s._gap_buffer["binance:BTCUSDT"]
+    assert len(gaps) == 1
+    assert gaps[0]["expected_update_id"] == 111
+    assert gaps[0]["received_update_id"] == 115
+    assert gaps[0]["gap_size"] == 4
+
+
+def test_no_gap_when_contiguous():
+    s = LOBStreamer(assets=["BTCUSDT"], output="local", resync_on_gap=False)
+    exch = s.exchange
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 100, "last_update_id": 110,
+    })
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 2,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 111, "last_update_id": 120,
+    })
+    assert s._gap_buffer["binance:BTCUSDT"] == []
+
+
+def test_same_batch_not_double_checked():
+    # Two rows (bid + ask) from the *same* message share first/last_update_id
+    # and must not be treated as two separate batches.
+    s = LOBStreamer(assets=["BTCUSDT"], output="local", resync_on_gap=False)
+    exch = s.exchange
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 100, "last_update_id": 110,
+    })
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "ask", "price": 2.0, "quantity": 1.0,
+        "first_update_id": 100, "last_update_id": 110,
+    })
+    assert s._gap_buffer["binance:BTCUSDT"] == []
+
+
+def test_gap_detection_noop_for_exchanges_without_sequence_ids():
+    s = LOBStreamer(assets=["BTC-USD"], exchange="coinbase", output="local", resync_on_gap=False)
+    exch = s.exchange
+    assert exch.has_sequence_ids is False
+    s._ingest("coinbase", exch, {
+        "type": "depth", "asset": "BTC-USD", "timestamp_ms": 1,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 1, "last_update_id": 1,
+    })
+    s._ingest("coinbase", exch, {
+        "type": "depth", "asset": "BTC-USD", "timestamp_ms": 9999,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 9999, "last_update_id": 9999,
+    })
+    assert s._gap_buffer["coinbase:BTC-USD"] == []
+
+
+def test_on_gap_callback():
+    received = []
+    s = LOBStreamer(
+        assets=["BTCUSDT"], output="local", resync_on_gap=False, on_gap=received.append
+    )
+    exch = s.exchange
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 100, "last_update_id": 110,
+    })
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 2,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 120, "last_update_id": 130,
+    })
+    assert len(received) == 1
+    assert received[0]["gap_size"] == 9
+
+
+# ── Kraken checksum verification (LOBStreamer-level wiring) ─────────────────
+
+def test_maybe_verify_checksum_logs_mismatch():
+    s = LOBStreamer(assets=["BTC/USD"], exchange="kraken", output="local", verify_checksums=True)
+    exch = s.exchange
+    raw = {
+        "channel": "book",
+        "type": "snapshot",
+        "data": [{
+            "symbol": "BTC/USD",
+            "bids": [{"price": "65000.0", "qty": "0.5"}],
+            "asks": [{"price": "65001.0", "qty": "0.3"}],
+            "checksum": 1,  # deliberately wrong
+        }],
+    }
+    s._maybe_verify_checksum(exch, raw, "snapshot")
+    failures = s._checksum_buffer["kraken:BTC/USD"]
+    assert len(failures) == 1
+    assert failures[0]["received"] == 1
+    assert failures[0]["expected"] != 1
+
+
+def test_maybe_verify_checksum_noop_when_disabled():
+    s = LOBStreamer(assets=["BTC/USD"], exchange="kraken", output="local", verify_checksums=False)
+    exch = s.exchange
+    raw = {
+        "channel": "book", "type": "snapshot",
+        "data": [{"symbol": "BTC/USD", "bids": [], "asks": [], "checksum": 1}],
+    }
+    s._maybe_verify_checksum(exch, raw, "snapshot")
+    assert s._checksum_buffer == {}
+
+
+def test_maybe_verify_checksum_noop_for_unsupported_exchange():
+    s = LOBStreamer(assets=["BTCUSDT"], exchange="binance", output="local", verify_checksums=True)
+    exch = s.exchange
+    assert exch.supports_checksum is False
+    raw = {
+        "channel": "book", "type": "snapshot",
+        "data": [{"symbol": "BTCUSDT", "bids": [], "asks": [], "checksum": 1}],
+    }
+    s._maybe_verify_checksum(exch, raw, "snapshot")
+    assert s._checksum_buffer == {}
+
+
+# ── Futures / funding records ───────────────────────────────────────────────
+
+def test_futures_exchange_registered():
+    s = LOBStreamer(assets=["BTCUSDT"], exchange="binance_futures", output="local")
+    assert s.exchange.name == "binance_futures"
+    assert "fapi.binance.com" in s.exchange.snapshot_url("BTCUSDT")
+
+
+def test_ingest_funding_record():
+    s = LOBStreamer(assets=["BTCUSDT"], exchange="binance_futures", output="local")
+    s._ingest("binance_futures", s.exchange, {
+        "type": "funding", "asset": "BTCUSDT", "timestamp_ms": 1700000000000,
+        "mark_price": 65010.5, "funding_rate": 0.0001, "next_funding_ms": 1700001800000,
+    })
+    funding = s._funding_buffer["binance_futures:BTCUSDT"]
+    assert len(funding) == 1
+    assert funding[0]["funding_rate"] == 0.0001
+    assert funding[0]["exchange"] == "binance_futures"
 
 
 # ── Config tests ──────────────────────────────────────────────────────────────
@@ -164,3 +373,28 @@ def test_gcs_connection_no_library(monkeypatch):
     ok, msg = check_gcs_connection("any-bucket")
     assert not ok
     assert "not installed" in msg.lower() or "import" in msg.lower() or isinstance(msg, str)
+
+def test_bybit_consecutive_real_messages_not_falsely_flagged_as_gap():
+    # Regression test for a real bug found via live testing: using
+    # Bybit's "seq" (cross sequence) for first_update_id instead of "u"
+    # (the real per-symbol counter) made every consecutive live message
+    # look like a gap of billions of missed updates, since the two
+    # counters are on completely different numeric scales. Uses the
+    # streamer's actual gap-detection path (not just the exchange parser)
+    # with realistic u/seq values taken from Bybit's own sample payloads.
+    s = LOBStreamer(exchange="bybit_linear", assets=["BTCUSDT"], output="local", resync_on_gap=False)
+    exch = s.exchange
+
+    msg1 = {"topic": "orderbook.50.BTCUSDT", "type": "delta", "ts": 1,
+            "data": {"s": "BTCUSDT", "u": 18521288, "seq": 7961638724,
+                       "b": [["1.0", "1.0"]], "a": []}}
+    msg2 = {"topic": "orderbook.50.BTCUSDT", "type": "delta", "ts": 2,
+            "data": {"s": "BTCUSDT", "u": 18521289, "seq": 7961638999,
+                       "b": [["1.0", "1.0"]], "a": []}}
+
+    for record in exch.parse_message(msg1):
+        s._ingest(exch.name, exch, record)
+    for record in exch.parse_message(msg2):
+        s._ingest(exch.name, exch, record)
+
+    assert s._gap_buffer.get("bybit_linear:BTCUSDT", []) == []

@@ -108,7 +108,7 @@ def main():
     _check_path_warning()
     parser = argparse.ArgumentParser(
         prog="crypto-lob-stream",
-        description="Stream Binance Level 2 order book and trade data to local disk or GCS.",
+        description="Stream Level 2 order book and trade data from major crypto exchanges to local disk or GCS.",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -159,7 +159,49 @@ def _add_stream_args(p: argparse.ArgumentParser):
     p.add_argument(
         "--exchange",
         default="binance",
-        help="Exchange to stream from: binance (default), coinbase, okx, kraken, or bybit",
+        help=(
+            "Exchange to stream from: binance (default), binance_futures, "
+            "coinbase, okx, okx_swap, kraken, bybit, or bybit_linear"
+        ),
+    )
+    p.add_argument(
+        "--exchanges",
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Stream multiple exchanges in one process/event loop. Format: "
+            "'exchange:assets;exchange:assets', e.g. "
+            "'binance:BTCUSDT,ETHUSDT;kraken:BTC/USD;okx:BTC-USDT'. "
+            "Overrides --exchange/--assets when given."
+        ),
+    )
+    p.add_argument(
+        "--verify-checksums",
+        action="store_true",
+        help=(
+            "Maintain a live order-book mirror and verify it against the "
+            "exchange-supplied checksum where supported (currently Kraken "
+            "only). Mismatches are logged and written to a checksums table. "
+            "Off by default."
+        ),
+    )
+    p.add_argument(
+        "--no-gap-detection",
+        action="store_true",
+        help=(
+            "Disable sequence-gap detection (on by default). Only "
+            "meaningful for exchanges with real sequence numbers "
+            "(currently binance, binance_futures, bybit, bybit_linear, okx, okx_swap)."
+        ),
+    )
+    p.add_argument(
+        "--no-gap-resync",
+        action="store_true",
+        help=(
+            "When a gap is detected, don't automatically re-fetch a fresh "
+            "snapshot (resync is on by default, and only applies to "
+            "exchanges with a REST snapshot endpoint)."
+        ),
     )
     p.add_argument(
         "--output",
@@ -207,20 +249,59 @@ def _add_stream_args(p: argparse.ArgumentParser):
     )
 
 
-def _run_stream(args):
-    # Validate assets
-    if not getattr(args, "assets", None):
-        print(
-            "Error: --assets is required.\n"
-            "Example: crypto-lob-stream --assets BTCUSDT,ETHUSDT",
-            file=sys.stderr,
-        )
+def _parse_exchanges_spec(spec: str) -> list:
+    """
+    Parse '--exchanges' syntax: 'exchange:asset1,asset2;exchange2:asset1'.
+    Returns [{"exchange": str, "assets": [str, ...]}, ...].
+    """
+    entries = []
+    for block in spec.split(";"):
+        block = block.strip()
+        if not block:
+            continue
+        if ":" not in block:
+            print(
+                f"Error: invalid --exchanges entry '{block}'. "
+                f"Expected 'exchange:asset1,asset2'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        exch_name, assets_str = block.split(":", 1)
+        exch_name = exch_name.strip()
+        assets = [a.strip() for a in assets_str.split(",") if a.strip()]
+        if not exch_name or not assets:
+            print(
+                f"Error: invalid --exchanges entry '{block}'. "
+                f"Both exchange and at least one asset are required.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        entries.append({"exchange": exch_name, "assets": assets})
+    if not entries:
+        print("Error: --exchanges must contain at least one entry.", file=sys.stderr)
         sys.exit(1)
+    return entries
 
-    assets = [a.strip() for a in args.assets.split(",") if a.strip()]
-    if not assets:
-        print("Error: --assets must contain at least one symbol.", file=sys.stderr)
-        sys.exit(1)
+
+def _run_stream(args):
+    exchanges_spec = getattr(args, "exchanges", None)
+
+    if exchanges_spec:
+        exchanges = _parse_exchanges_spec(exchanges_spec)
+        assets = None
+    else:
+        if not getattr(args, "assets", None):
+            print(
+                "Error: --assets is required (or use --exchanges for multiple exchanges).\n"
+                "Example: crypto-lob-stream --assets BTCUSDT,ETHUSDT",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        assets = [a.strip() for a in args.assets.split(",") if a.strip()]
+        if not assets:
+            print("Error: --assets must contain at least one symbol.", file=sys.stderr)
+            sys.exit(1)
+        exchanges = None
 
     # Resolve GCS settings
     bucket = getattr(args, "bucket", None) or get_saved_bucket()
@@ -246,12 +327,16 @@ def _run_stream(args):
         streamer = LOBStreamer(
             assets=assets,
             exchange=getattr(args, "exchange", "binance"),
+            exchanges=exchanges,
             output=args.output,
             output_dir=args.output_dir,
             bucket=bucket,
             fallback_dir=args.fallback_dir,
             flush_interval=args.flush_interval,
             log_dir=args.log_dir,
+            detect_gaps=not getattr(args, "no_gap_detection", False),
+            resync_on_gap=not getattr(args, "no_gap_resync", False),
+            verify_checksums=getattr(args, "verify_checksums", False),
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)

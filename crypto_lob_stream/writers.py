@@ -16,16 +16,16 @@ MAX_RETRY_ATTEMPTS = 3
 
 # ── Local writer ──────────────────────────────────────────────────────────────
 
-def write_local(records, schema, output_dir, prefix, asset, ts_str):
+def write_local(records, schema, output_dir, prefix, exchange, asset, ts_str):
     """Write records to a local Parquet file.
 
-    Path: {output_dir}/{prefix}/{asset}/{ts_str}.parquet
+    Path: {output_dir}/{prefix}/{exchange}/{asset}/{ts_str}.parquet
     Creates directories as needed.
     """
     if not records:
         return True
 
-    out_path = Path(output_dir) / prefix / asset / f"{ts_str}.parquet"
+    out_path = Path(output_dir) / prefix / exchange / asset / f"{ts_str}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -40,16 +40,17 @@ def write_local(records, schema, output_dir, prefix, asset, ts_str):
 
 # ── GCS writer ────────────────────────────────────────────────────────────────
 
-def write_gcs(records, schema, bucket_name, prefix, asset, ts_str, fallback_dir=None):
+def write_gcs(records, schema, bucket_name, prefix, exchange, asset, ts_str, fallback_dir=None):
     """Upload records to GCS with retry and optional local fallback.
 
+    Blob path: {prefix}/{exchange}/{asset}/{ts_str}.parquet
     Records are never silently dropped: if all GCS retries fail and a
     fallback_dir is provided, the Parquet file is saved there instead.
     """
     if not records:
         return True
 
-    blob_path = f"{prefix}/{asset}/{ts_str}.parquet"
+    blob_path = f"{prefix}/{exchange}/{asset}/{ts_str}.parquet"
     tmp_path = None
 
     try:
@@ -59,8 +60,8 @@ def write_gcs(records, schema, bucket_name, prefix, asset, ts_str, fallback_dir=
         table = pa.Table.from_pylist(records, schema=schema)
         pq.write_table(table, tmp_path, compression="snappy")
     except Exception as e:
-        logger.error(f"Serialisation failed for {prefix}/{asset}: {e}")
-        _emergency_json_fallback(records, fallback_dir, prefix, asset, ts_str)
+        logger.error(f"Serialisation failed for {prefix}/{exchange}/{asset}: {e}")
+        _emergency_json_fallback(records, fallback_dir, prefix, exchange, asset, ts_str)
         return False
 
     # Lazy import -- users who use local output only don't need google-cloud-storage
@@ -86,7 +87,7 @@ def write_gcs(records, schema, bucket_name, prefix, asset, ts_str, fallback_dir=
 
     logger.error(f"All GCS retries failed for {blob_path}.")
     if fallback_dir:
-        fallback_path = Path(fallback_dir) / f"{prefix}_{asset}_{ts_str}.parquet"
+        fallback_path = Path(fallback_dir) / f"{prefix}_{exchange}_{asset}_{ts_str}.parquet"
         fallback_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy(tmp_path, fallback_path)
@@ -100,11 +101,11 @@ def write_gcs(records, schema, bucket_name, prefix, asset, ts_str, fallback_dir=
     return False
 
 
-def _emergency_json_fallback(records, fallback_dir, prefix, asset, ts_str):
+def _emergency_json_fallback(records, fallback_dir, prefix, exchange, asset, ts_str):
     if not fallback_dir:
         return
     try:
-        path = Path(fallback_dir) / f"{prefix}_{asset}_{ts_str}.json"
+        path = Path(fallback_dir) / f"{prefix}_{exchange}_{asset}_{ts_str}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(records, f)
@@ -128,10 +129,13 @@ def retry_gcs_fallbacks(fallback_dir, bucket_name):
     for f in files:
         try:
             client = gcs.Client()
-            parts = f.stem.split("_", 2)
-            if len(parts) == 3:
-                prefix, asset, ts_str = parts
-                blob_path = f"{prefix}/{asset}/{ts_str}.parquet"
+            # Fallback filenames are "{prefix}_{exchange}_{asset}_{ts_str}.parquet".
+            # asset/ts_str themselves never contain "_" in current schemas, so a
+            # max-3-split is safe and reverses write_gcs's naming exactly.
+            parts = f.stem.split("_", 3)
+            if len(parts) == 4:
+                prefix, exchange, asset, ts_str = parts
+                blob_path = f"{prefix}/{exchange}/{asset}/{ts_str}.parquet"
                 client.bucket(bucket_name).blob(blob_path).upload_from_filename(str(f))
                 logger.info(f"Re-uploaded: {blob_path}")
                 f.unlink()

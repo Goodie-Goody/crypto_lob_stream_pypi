@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-lob-stream"
-version = "0.6.1"
-description = "Stream Binance Level 2 order book and trade data to local disk or GCS."
+version = "0.7.0"
+description = "Stream Level 2 order book and trade data from major crypto exchanges to local disk or GCS."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
