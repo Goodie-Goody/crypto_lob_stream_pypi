@@ -11,6 +11,7 @@ from typing import Callable, List, Literal, Optional
 import aiohttp
 import websockets
 
+from .exchanges import get_exchange
 from .schemas import DEPTH_SCHEMA, SNAPSHOT_SCHEMA, TRADE_SCHEMA
 from .writers import retry_gcs_fallbacks, write_gcs, write_local
 
@@ -20,30 +21,29 @@ OutputType = Literal["local", "gcs"]
 
 
 class LOBStreamer:
-    """Stream Binance order book and trade data to local disk or GCS.
+    """Stream order book and trade data from a crypto exchange to local disk or GCS.
 
     Parameters
     ----------
     assets : list of str
-        Binance trading pair symbols, e.g. ["BTCUSDT", "ETHUSDT"].
-        Case-insensitive; stored internally as lowercase.
+        Trading pair symbols. Format is normalised per exchange, so you can
+        pass "BTCUSDT" or "BTC-USD" and the adapter converts as needed.
+    exchange : str
+        Exchange to stream from. Default "binance". Also supports "coinbase".
     output : "local" or "gcs"
         Where to write Parquet files.
     output_dir : str, optional
-        Base directory for local output. Required when output="local".
-        Defaults to "./lob_data".
+        Base directory for local output. Defaults to "./lob_data".
     bucket : str, optional
         GCS bucket name. Required when output="gcs".
     fallback_dir : str, optional
         Local fallback directory used when GCS uploads fail.
-        Defaults to "./lob_fallback" when output="gcs".
     flush_interval : int
         Seconds between buffer flushes. Default 300 (5 minutes).
     on_trade : callable, optional
-        Optional callback invoked for every trade record dict before
-        it is buffered. Useful for real-time monitoring or custom sinks.
+        Optional callback invoked for every normalised trade record.
     on_depth : callable, optional
-        Optional callback invoked for every depth record dict.
+        Optional callback invoked for every normalised depth record.
     log_dir : str
         Directory for rotating log files. Default "./logs".
     """
@@ -51,6 +51,7 @@ class LOBStreamer:
     def __init__(
         self,
         assets: List[str],
+        exchange: str = "binance",
         output: OutputType = "local",
         output_dir: str = "./lob_data",
         bucket: Optional[str] = None,
@@ -67,7 +68,12 @@ class LOBStreamer:
         if output not in ("local", "gcs"):
             raise ValueError("output must be 'local' or 'gcs'.")
 
-        self.assets = [a.lower() for a in assets]
+        # Resolve the exchange adapter (raises ValueError on unknown name)
+        self.exchange = get_exchange(exchange)
+
+        # Normalise each asset to the exchange's native symbol format
+        self.assets = [self.exchange.normalize_symbol(a) for a in assets]
+
         self.output = output
         self.output_dir = output_dir
         self.bucket = bucket
@@ -79,6 +85,10 @@ class LOBStreamer:
         self._trade_buffer: dict = defaultdict(list)
         self._depth_buffer: dict = defaultdict(list)
         self._last_flush: float = time.time()
+
+        # Tracks which assets have had their initial snapshot captured,
+        # for exchanges that deliver the snapshot over the socket.
+        self._snapshot_taken: set = set()
 
         self._setup_logging(log_dir)
 
@@ -103,121 +113,76 @@ class LOBStreamer:
             logger.addHandler(ch)
             logger.setLevel(logging.INFO)
 
-    # ── Stream URL ────────────────────────────────────────────────────────────
-
-    def _get_stream_url(self) -> str:
-        streams = []
-        for asset in self.assets:
-            streams.append(f"{asset}@trade")
-            streams.append(f"{asset}@depth@100ms")
-        return f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
-
-    # ── Snapshot fetch ────────────────────────────────────────────────────────
+    # ── Snapshot fetch (REST-based exchanges, e.g. Binance) ─────────────────────
 
     async def _fetch_snapshot(self, asset: str):
-        url = f"https://api.binance.com/api/v3/depth?symbol={asset.upper()}&limit=1000"
+        url = self.exchange.snapshot_url(asset)
+        if not url:
+            # Exchange delivers its snapshot over the socket; nothing to fetch.
+            return
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status != 200:
                         logger.error(f"Snapshot HTTP {resp.status} for {asset}")
                         return
-                    snap = await resp.json()
+                    raw = await resp.json()
         except Exception as e:
             logger.error(f"Snapshot fetch failed for {asset}: {e}")
             return
 
-        ts = int(time.time() * 1000)
-        last_uid = int(snap["lastUpdateId"])
-        records = []
-        for price, qty in snap.get("bids", []):
-            records.append({
-                "timestamp_ms":   ts,
-                "asset":          asset.upper(),
-                "side":           "bid",
-                "price":          float(price),
-                "quantity":       float(qty),
-                "last_update_id": last_uid,
-            })
-        for price, qty in snap.get("asks", []):
-            records.append({
-                "timestamp_ms":   ts,
-                "asset":          asset.upper(),
-                "side":           "ask",
-                "price":          float(price),
-                "quantity":       float(qty),
-                "last_update_id": last_uid,
-            })
-
+        records = self.exchange.parse_snapshot(asset, raw)
+        if not records:
+            return
         ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
         self._write(records, SNAPSHOT_SCHEMA, "snapshots", asset, ts_str)
+        last_uid = records[0].get("last_update_id", 0)
         logger.info(
             f"Snapshot stored for {asset.upper()} | "
             f"lastUpdateId={last_uid} | levels={len(records)}"
         )
 
-    # ── Message handlers ──────────────────────────────────────────────────────
-
-    def _handle_trade(self, asset: str, data: dict):
-        required = {"T", "t", "p", "q", "m"}
-        if not required.issubset(data):
-            logger.warning(f"Malformed trade message for {asset}: {data}")
+    def _store_socket_snapshot(self, asset: str, raw: dict):
+        """Store a snapshot delivered over the WebSocket (e.g. Coinbase)."""
+        records = self.exchange.parse_snapshot(asset, raw)
+        if not records:
             return
-        try:
-            record = {
-                "timestamp_ms": int(data["T"]),
-                "asset":        asset.upper(),
-                "trade_id":     int(data["t"]),
-                "price":        float(data["p"]),
-                "quantity":     float(data["q"]),
-                "buyer_maker":  bool(data["m"]),
+        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+        self._write(records, SNAPSHOT_SCHEMA, "snapshots", asset, ts_str)
+        logger.info(
+            f"Snapshot stored for {asset.upper()} | levels={len(records)}"
+        )
+
+    # ── Normalised record dispatch ──────────────────────────────────────────────
+
+    def _ingest(self, record: dict):
+        rtype = record.get("type")
+        asset = record["asset"]
+        if rtype == "trade":
+            clean = {
+                "timestamp_ms": record["timestamp_ms"],
+                "asset":        asset,
+                "trade_id":     record["trade_id"],
+                "price":        record["price"],
+                "quantity":     record["quantity"],
+                "buyer_maker":  record["buyer_maker"],
             }
             if self.on_trade:
-                self.on_trade(record)
-            self._trade_buffer[asset].append(record)
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Trade parse error for {asset}: {e} | raw: {data}")
-
-    def _handle_depth(self, asset: str, data: dict):
-        required = {"U", "u", "b", "a"}
-        if not required.issubset(data):
-            logger.warning(
-                f"Malformed depth message for {asset} "
-                f"(missing fields): {list(data.keys())}"
-            )
-            return
-        try:
-            ts = int(time.time() * 1000)
-            first_uid = int(data["U"])
-            last_uid  = int(data["u"])
-            for price, qty in data["b"]:
-                record = {
-                    "timestamp_ms":    ts,
-                    "asset":           asset.upper(),
-                    "side":            "bid",
-                    "price":           float(price),
-                    "quantity":        float(qty),
-                    "first_update_id": first_uid,
-                    "last_update_id":  last_uid,
-                }
-                if self.on_depth:
-                    self.on_depth(record)
-                self._depth_buffer[asset].append(record)
-            for price, qty in data["a"]:
-                record = {
-                    "timestamp_ms":    ts,
-                    "asset":           asset.upper(),
-                    "side":            "ask",
-                    "price":           float(price),
-                    "quantity":        float(qty),
-                    "first_update_id": first_uid,
-                    "last_update_id":  last_uid,
-                }
-                if self.on_depth:
-                    self.on_depth(record)
-                self._depth_buffer[asset].append(record)
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Depth parse error for {asset}: {e}")
+                self.on_trade(clean)
+            self._trade_buffer[asset].append(clean)
+        elif rtype == "depth":
+            clean = {
+                "timestamp_ms":    record["timestamp_ms"],
+                "asset":           asset,
+                "side":            record["side"],
+                "price":           record["price"],
+                "quantity":        record["quantity"],
+                "first_update_id": record["first_update_id"],
+                "last_update_id":  record["last_update_id"],
+            }
+            if self.on_depth:
+                self.on_depth(clean)
+            self._depth_buffer[asset].append(clean)
 
     # ── Write dispatch ────────────────────────────────────────────────────────
 
@@ -278,7 +243,7 @@ class LOBStreamer:
 
             if trades_saved or depth_saved:
                 print(
-                    f"[{flush_time}] {asset.upper():10s} "
+                    f"[{flush_time}] {asset.upper():12s} "
                     f"trades: {trades_saved:>7,} | "
                     f"depth events: {depth_saved:>9,} | saved"
                 )
@@ -288,7 +253,8 @@ class LOBStreamer:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def _stream(self):
-        url = self._get_stream_url()
+        url = self.exchange.ws_url(self.assets)
+        subscribe_msgs = self.exchange.subscribe_messages(self.assets)
         reconnect_delay = 5
 
         if self.output == "gcs":
@@ -297,18 +263,29 @@ class LOBStreamer:
         while True:
             heartbeat_task = None
             try:
-                logger.info("Connecting to Binance WebSocket...")
-                async with websockets.connect(url, ping_interval=180) as ws:
+                logger.info(f"Connecting to {self.exchange.name} WebSocket...")
+                async with websockets.connect(
+                    url, ping_interval=180, max_size=self.exchange.ws_max_size
+                ) as ws:
                     logger.info(
                         f"Connected. Streaming: {[a.upper() for a in self.assets]}"
                     )
                     reconnect_delay = 5
 
-                    logger.info("Fetching order book snapshots...")
-                    await asyncio.gather(
-                        *[self._fetch_snapshot(a) for a in self.assets]
-                    )
-                    logger.info("Snapshots done. Processing live stream.")
+                    # Send subscription messages if the exchange needs them
+                    for msg in subscribe_msgs:
+                        await ws.send(json.dumps(msg))
+
+                    # REST snapshots (no-op for socket-snapshot exchanges)
+                    snapshot_urls = [self.exchange.snapshot_url(a) for a in self.assets]
+                    if any(snapshot_urls):
+                        logger.info("Fetching order book snapshots...")
+                        await asyncio.gather(
+                            *[self._fetch_snapshot(a) for a in self.assets]
+                        )
+                        logger.info("Snapshots done. Processing live stream.")
+                    else:
+                        logger.info("Processing live stream (snapshot via socket).")
 
                     async def heartbeat():
                         while True:
@@ -318,15 +295,18 @@ class LOBStreamer:
                     heartbeat_task = asyncio.create_task(heartbeat())
 
                     async for message in ws:
-                        data = json.loads(message)
-                        stream_name = data.get("stream", "")
-                        payload = data.get("data", {})
-                        asset = stream_name.split("@")[0]
+                        raw = json.loads(message)
 
-                        if "@trade" in stream_name:
-                            self._handle_trade(asset, payload)
-                        elif "@depth" in stream_name:
-                            self._handle_depth(asset, payload)
+                        # Handle socket-delivered snapshots (e.g. Coinbase level2)
+                        if raw.get("type") == "snapshot":
+                            asset = raw.get("product_id", "").upper()
+                            if asset and asset not in self._snapshot_taken:
+                                self._store_socket_snapshot(asset, raw)
+                                self._snapshot_taken.add(asset)
+                            continue
+
+                        for record in self.exchange.parse_message(raw):
+                            self._ingest(record)
 
             except Exception as e:
                 logger.error(f"Stream error: {e}. Reconnecting in {reconnect_delay}s...")
@@ -338,6 +318,8 @@ class LOBStreamer:
                     except asyncio.CancelledError:
                         pass
                 self._flush(force=True)
+                # Allow snapshots to be re-taken on reconnect
+                self._snapshot_taken.clear()
 
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
@@ -345,6 +327,7 @@ class LOBStreamer:
     def run(self):
         """Start the streamer. Blocks until interrupted."""
         logger.info(f"Starting LOBStreamer")
+        logger.info(f"Exchange: {self.exchange.name}")
         logger.info(f"Assets  : {[a.upper() for a in self.assets]}")
         logger.info(f"Output  : {self.output}")
         if self.output == "local":
@@ -356,3 +339,4 @@ class LOBStreamer:
             asyncio.run(self._stream())
         except KeyboardInterrupt:
             print("\nStopped. Final buffers flushed.")
+            

@@ -154,7 +154,12 @@ def _add_stream_args(p: argparse.ArgumentParser):
     p.add_argument(
         "--assets",
         default=None,
-        help="Comma-separated Binance symbols, e.g. BTCUSDT,ETHUSDT,SOLUSDT",
+        help="Comma-separated symbols, e.g. BTCUSDT,ETHUSDT (Binance) or BTC-USD (Coinbase)",
+    )
+    p.add_argument(
+        "--exchange",
+        default="binance",
+        help="Exchange to stream from: binance (default) or coinbase",
     )
     p.add_argument(
         "--output",
@@ -237,15 +242,20 @@ def _run_stream(args):
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-    streamer = LOBStreamer(
-        assets=assets,
-        output=args.output,
-        output_dir=args.output_dir,
-        bucket=bucket,
-        fallback_dir=args.fallback_dir,
-        flush_interval=args.flush_interval,
-        log_dir=args.log_dir,
-    )
+    try:
+        streamer = LOBStreamer(
+            assets=assets,
+            exchange=getattr(args, "exchange", "binance"),
+            output=args.output,
+            output_dir=args.output_dir,
+            bucket=bucket,
+            fallback_dir=args.fallback_dir,
+            flush_interval=args.flush_interval,
+            log_dir=args.log_dir,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     streamer.run()
 
 
