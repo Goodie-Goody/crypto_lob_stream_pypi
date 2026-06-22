@@ -80,6 +80,20 @@ class Exchange(ABC):
     def parse_snapshot(self, asset: str, raw: dict) -> List[dict]:
         """Parse a raw REST snapshot response into normalised level records."""
 
+    # -- Socket-delivered snapshots ---------------------------------------
+
+    def is_socket_snapshot(self, raw: dict) -> bool:
+        """
+        Return True if this raw message is a full book snapshot delivered
+        over the socket (rather than via REST). Default False (REST-based
+        exchanges like Binance). Exchanges that push snapshots override this.
+        """
+        return False
+
+    def socket_snapshot_asset(self, raw: dict) -> str:
+        """Return the asset symbol for a socket-delivered snapshot message."""
+        return raw.get("product_id", "").upper()
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Binance
@@ -294,6 +308,12 @@ class CoinbaseExchange(Exchange):
         # Coinbase delivers its snapshot over the socket, not via REST.
         return ""
 
+    def is_socket_snapshot(self, raw: dict) -> bool:
+        return raw.get("type") == "snapshot"
+
+    def socket_snapshot_asset(self, raw: dict) -> str:
+        return raw.get("product_id", "").upper()
+
     def parse_snapshot(self, asset: str, raw: dict) -> List[dict]:
         # Used when the first level2 message of type "snapshot" arrives.
         ts = int(time.time() * 1000)
@@ -320,12 +340,469 @@ class CoinbaseExchange(Exchange):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# OKX (v5 public WebSocket)
+# ──────────────────────────────────────────────────────────────────────────
+
+class OKXExchange(Exchange):
+    """
+    OKX v5 public WebSocket feed (wss://ws.okx.com:8443/ws/v5/public).
+
+    Model:
+      - Connect, then send a subscribe message listing channels + instId.
+      - The `books` channel sends action="snapshot" first (full book, 400
+        levels), then action="update" deltas. Quantity 0 removes a level.
+      - The `trades` channel sends each execution.
+      - Messages are wrapped: {"arg": {...}, "action": ..., "data": [...]}.
+      - OKX provides seqId / prevSeqId on book messages for ordering, which
+        map to last_update_id / first_update_id.
+      - Symbol format is dash-separated, e.g. BTC-USDT.
+    """
+
+    name = "okx"
+    ws_max_size = 16 * 1024 * 1024  # books snapshots can be large
+
+    def ws_url(self, assets: List[str]) -> str:
+        return "wss://ws.okx.com:8443/ws/v5/public"
+
+    def subscribe_messages(self, assets: List[str]) -> List[dict]:
+        args = []
+        for a in assets:
+            inst = self.normalize_symbol(a)
+            args.append({"channel": "books", "instId": inst})
+            args.append({"channel": "trades", "instId": inst})
+        return [{"op": "subscribe", "args": args}]
+
+    def normalize_symbol(self, symbol: str) -> str:
+        s = symbol.upper().replace("/", "-")
+        if "-" in s:
+            return s
+        for quote in ("USDT", "USDC", "USD", "EUR", "GBP", "BTC"):
+            if s.endswith(quote) and len(s) > len(quote):
+                return f"{s[:-len(quote)]}-{quote}"
+        return s
+
+    def parse_message(self, raw: dict) -> List[dict]:
+        arg = raw.get("arg", {})
+        channel = arg.get("channel", "")
+        data = raw.get("data", [])
+        if not channel or not data:
+            return []
+
+        inst = arg.get("instId", "").upper()
+
+        # Trades
+        if channel == "trades":
+            out = []
+            for t in data:
+                try:
+                    # OKX side is the taker side: "buy" or "sell".
+                    # buyer_maker is True when the taker was a seller
+                    # (i.e. the resting buy order — the maker — was hit).
+                    buyer_maker = (t.get("side") == "sell")
+                    out.append({
+                        "type":         "trade",
+                        "asset":        inst,
+                        "timestamp_ms": int(t["ts"]),
+                        "trade_id":     int(t["tradeId"]),
+                        "price":        float(t["px"]),
+                        "quantity":     float(t["sz"]),
+                        "buyer_maker":  buyer_maker,
+                    })
+                except (ValueError, TypeError, KeyError):
+                    continue
+            return out
+
+        # Order book updates (snapshots are handled via is_socket_snapshot)
+        if channel == "books":
+            action = raw.get("action", "")
+            if action == "snapshot":
+                return []  # handled by the snapshot path
+            out = []
+            for book in data:
+                ts = int(book.get("ts", 0))
+                seq = int(book.get("seqId", ts))
+                prev = int(book.get("prevSeqId", seq))
+                for price, qty, *_ in book.get("bids", []):
+                    out.append({
+                        "type":            "depth",
+                        "asset":           inst,
+                        "timestamp_ms":    ts,
+                        "side":            "bid",
+                        "price":           float(price),
+                        "quantity":        float(qty),
+                        "first_update_id": prev,
+                        "last_update_id":  seq,
+                    })
+                for price, qty, *_ in book.get("asks", []):
+                    out.append({
+                        "type":            "depth",
+                        "asset":           inst,
+                        "timestamp_ms":    ts,
+                        "side":            "ask",
+                        "price":           float(price),
+                        "quantity":        float(qty),
+                        "first_update_id": prev,
+                        "last_update_id":  seq,
+                    })
+            return out
+
+        return []
+
+    def snapshot_url(self, asset: str) -> str:
+        # OKX delivers the snapshot over the socket on the books channel.
+        return ""
+
+    def is_socket_snapshot(self, raw: dict) -> bool:
+        return (
+            raw.get("arg", {}).get("channel") == "books"
+            and raw.get("action") == "snapshot"
+        )
+
+    def socket_snapshot_asset(self, raw: dict) -> str:
+        return raw.get("arg", {}).get("instId", "").upper()
+
+    def parse_snapshot(self, asset: str, raw: dict) -> List[dict]:
+        data = raw.get("data", [])
+        if not data:
+            return []
+        book = data[0]
+        ts = int(book.get("ts", 0)) or int(time.time() * 1000)
+        seq = int(book.get("seqId", ts))
+        records = []
+        for price, qty, *_ in book.get("bids", []):
+            records.append({
+                "timestamp_ms":   ts,
+                "asset":          asset.upper(),
+                "side":           "bid",
+                "price":          float(price),
+                "quantity":       float(qty),
+                "last_update_id": seq,
+            })
+        for price, qty, *_ in book.get("asks", []):
+            records.append({
+                "timestamp_ms":   ts,
+                "asset":          asset.upper(),
+                "side":           "ask",
+                "price":          float(price),
+                "quantity":       float(qty),
+                "last_update_id": seq,
+            })
+        return records
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Kraken (v2 public WebSocket)
+# ──────────────────────────────────────────────────────────────────────────
+
+class KrakenExchange(Exchange):
+    """
+    Kraken v2 public WebSocket feed (wss://ws.kraken.com/v2).
+
+    Model:
+      - Connect, then send subscribe messages for the book and trade channels.
+      - The `book` channel sends type="snapshot" first, then type="update".
+        Unlike other exchanges, Kraken expresses levels as objects
+        {"price": ..., "qty": ...} rather than [price, qty] arrays.
+        qty 0 removes a level.
+      - The `trade` channel sends executions with side/price/qty/trade_id/timestamp.
+      - Symbol format is slash-separated, e.g. BTC/USD.
+      - Kraken has no Binance-style sequence IDs on book updates; the message
+        timestamp (ms) is used as the ordering key. A CRC32 checksum is provided
+        for client-side book verification (not used here).
+      - Control messages: subscription acks carry a "method" key; heartbeat and
+        status arrive on their own channels. All are ignored.
+    """
+
+    name = "kraken"
+    ws_max_size = 16 * 1024 * 1024
+
+    def ws_url(self, assets: List[str]) -> str:
+        return "wss://ws.kraken.com/v2"
+
+    def subscribe_messages(self, assets: List[str]) -> List[dict]:
+        symbols = [self.normalize_symbol(a) for a in assets]
+        return [
+            {"method": "subscribe",
+             "params": {"channel": "book", "symbol": symbols, "depth": 25}},
+            {"method": "subscribe",
+             "params": {"channel": "trade", "symbol": symbols}},
+        ]
+
+    def normalize_symbol(self, symbol: str) -> str:
+        s = symbol.upper().replace("-", "/")
+        if "/" in s:
+            return s
+        for quote in ("USDT", "USDC", "USD", "EUR", "GBP", "BTC"):
+            if s.endswith(quote) and len(s) > len(quote):
+                return f"{s[:-len(quote)]}/{quote}"
+        return s
+
+    def _ms(self, iso_time: str) -> int:
+        from datetime import datetime
+        try:
+            return int(datetime.fromisoformat(
+                iso_time.replace("Z", "+00:00")
+            ).timestamp() * 1000)
+        except Exception:
+            return int(time.time() * 1000)
+
+    def parse_message(self, raw: dict) -> List[dict]:
+        channel = raw.get("channel", "")
+        msg_type = raw.get("type", "")
+        data = raw.get("data", [])
+        if not channel or not data:
+            return []
+
+        # Trades
+        if channel == "trade":
+            out = []
+            for t in data:
+                try:
+                    # Kraken side is the aggressor (taker) side.
+                    buyer_maker = (t.get("side") == "sell")
+                    out.append({
+                        "type":         "trade",
+                        "asset":        t.get("symbol", "").upper(),
+                        "timestamp_ms": self._ms(t.get("timestamp", "")),
+                        "trade_id":     int(t.get("trade_id", 0)),
+                        "price":        float(t["price"]),
+                        "quantity":     float(t["qty"]),
+                        "buyer_maker":  buyer_maker,
+                    })
+                except (ValueError, TypeError, KeyError):
+                    continue
+            return out
+
+        # Book updates (snapshots handled via is_socket_snapshot)
+        if channel == "book":
+            if msg_type == "snapshot":
+                return []
+            out = []
+            for book in data:
+                asset = book.get("symbol", "").upper()
+                ts = self._ms(book.get("timestamp", ""))
+                for lvl in book.get("bids", []):
+                    out.append({
+                        "type":            "depth",
+                        "asset":           asset,
+                        "timestamp_ms":    ts,
+                        "side":            "bid",
+                        "price":           float(lvl["price"]),
+                        "quantity":        float(lvl["qty"]),
+                        "first_update_id": ts,
+                        "last_update_id":  ts,
+                    })
+                for lvl in book.get("asks", []):
+                    out.append({
+                        "type":            "depth",
+                        "asset":           asset,
+                        "timestamp_ms":    ts,
+                        "side":            "ask",
+                        "price":           float(lvl["price"]),
+                        "quantity":        float(lvl["qty"]),
+                        "first_update_id": ts,
+                        "last_update_id":  ts,
+                    })
+            return out
+
+        return []
+
+    def snapshot_url(self, asset: str) -> str:
+        return ""
+
+    def is_socket_snapshot(self, raw: dict) -> bool:
+        return raw.get("channel") == "book" and raw.get("type") == "snapshot"
+
+    def socket_snapshot_asset(self, raw: dict) -> str:
+        data = raw.get("data", [])
+        if data:
+            return data[0].get("symbol", "").upper()
+        return ""
+
+    def parse_snapshot(self, asset: str, raw: dict) -> List[dict]:
+        data = raw.get("data", [])
+        if not data:
+            return []
+        book = data[0]
+        ts = self._ms(book.get("timestamp", "")) or int(time.time() * 1000)
+        records = []
+        for lvl in book.get("bids", []):
+            records.append({
+                "timestamp_ms":   ts,
+                "asset":          asset.upper(),
+                "side":           "bid",
+                "price":          float(lvl["price"]),
+                "quantity":       float(lvl["qty"]),
+                "last_update_id": ts,
+            })
+        for lvl in book.get("asks", []):
+            records.append({
+                "timestamp_ms":   ts,
+                "asset":          asset.upper(),
+                "side":           "ask",
+                "price":          float(lvl["price"]),
+                "quantity":       float(lvl["qty"]),
+                "last_update_id": ts,
+            })
+        return records
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Bybit (v5 public spot WebSocket)
+# ──────────────────────────────────────────────────────────────────────────
+
+class BybitExchange(Exchange):
+    """
+    Bybit v5 public spot WebSocket feed (wss://stream.bybit.com/v5/public/spot).
+
+    Model:
+      - Connect, then send {"op": "subscribe", "args": [...]} listing topics
+        like "orderbook.50.BTCUSDT" and "publicTrade.BTCUSDT".
+      - The orderbook topic sends type="snapshot" first, then type="delta".
+        Bids/asks are [price, qty] arrays; qty "0" removes a level. Bybit
+        provides a real update id `u` and `seq`, used as the ordering key.
+      - The publicTrade topic sends trade arrays (type snapshot or delta;
+        both carry trade data and are treated identically).
+      - Symbol format is concatenated, e.g. BTCUSDT.
+      - Control messages: subscribe acks carry op/success; pong frames carry
+        op="pong". All are ignored.
+    """
+
+    name = "bybit"
+    ws_max_size = 16 * 1024 * 1024
+
+    def ws_url(self, assets: List[str]) -> str:
+        return "wss://stream.bybit.com/v5/public/spot"
+
+    def subscribe_messages(self, assets: List[str]) -> List[dict]:
+        args = []
+        for a in assets:
+            sym = self.normalize_symbol(a)
+            args.append(f"orderbook.50.{sym}")
+            args.append(f"publicTrade.{sym}")
+        return [{"op": "subscribe", "args": args}]
+
+    def normalize_symbol(self, symbol: str) -> str:
+        return symbol.upper().replace("-", "").replace("/", "")
+
+    def parse_message(self, raw: dict) -> List[dict]:
+        topic = raw.get("topic", "")
+        if not topic:
+            return []
+
+        # Trades: publicTrade.<SYMBOL>
+        if topic.startswith("publicTrade."):
+            data = raw.get("data", [])
+            out = []
+            for t in data:
+                try:
+                    # Bybit "S" is the taker side (Buy/Sell).
+                    buyer_maker = (t.get("S") == "Sell")
+                    out.append({
+                        "type":         "trade",
+                        "asset":        t.get("s", "").upper(),
+                        "timestamp_ms": int(t["T"]),
+                        "trade_id":     self._trade_id(t.get("i", 0)),
+                        "price":        float(t["p"]),
+                        "quantity":     float(t["v"]),
+                        "buyer_maker":  buyer_maker,
+                    })
+                except (ValueError, TypeError, KeyError):
+                    continue
+            return out
+
+        # Orderbook: orderbook.<depth>.<SYMBOL>
+        if topic.startswith("orderbook."):
+            if raw.get("type") == "snapshot":
+                return []  # handled by snapshot path
+            data = raw.get("data", {})
+            asset = data.get("s", "").upper()
+            ts = int(raw.get("ts", 0))
+            uid = int(data.get("u", ts))
+            seq = int(data.get("seq", uid))
+            out = []
+            for price, qty in data.get("b", []):
+                out.append({
+                    "type":            "depth",
+                    "asset":           asset,
+                    "timestamp_ms":    ts,
+                    "side":            "bid",
+                    "price":           float(price),
+                    "quantity":        float(qty),
+                    "first_update_id": seq,
+                    "last_update_id":  uid,
+                })
+            for price, qty in data.get("a", []):
+                out.append({
+                    "type":            "depth",
+                    "asset":           asset,
+                    "timestamp_ms":    ts,
+                    "side":            "ask",
+                    "price":           float(price),
+                    "quantity":        float(qty),
+                    "first_update_id": seq,
+                    "last_update_id":  uid,
+                })
+            return out
+
+        return []
+
+    @staticmethod
+    def _trade_id(raw_id) -> int:
+        # Bybit trade IDs may be UUID strings; hash to a stable int if so.
+        try:
+            return int(raw_id)
+        except (ValueError, TypeError):
+            return abs(hash(str(raw_id))) % (10 ** 18)
+
+    def snapshot_url(self, asset: str) -> str:
+        return ""
+
+    def is_socket_snapshot(self, raw: dict) -> bool:
+        return (
+            str(raw.get("topic", "")).startswith("orderbook.")
+            and raw.get("type") == "snapshot"
+        )
+
+    def socket_snapshot_asset(self, raw: dict) -> str:
+        return raw.get("data", {}).get("s", "").upper()
+
+    def parse_snapshot(self, asset: str, raw: dict) -> List[dict]:
+        data = raw.get("data", {})
+        ts = int(raw.get("ts", 0)) or int(time.time() * 1000)
+        uid = int(data.get("u", ts))
+        records = []
+        for price, qty in data.get("b", []):
+            records.append({
+                "timestamp_ms":   ts,
+                "asset":          asset.upper(),
+                "side":           "bid",
+                "price":          float(price),
+                "quantity":       float(qty),
+                "last_update_id": uid,
+            })
+        for price, qty in data.get("a", []):
+            records.append({
+                "timestamp_ms":   ts,
+                "asset":          asset.upper(),
+                "side":           "ask",
+                "price":          float(price),
+                "quantity":       float(qty),
+                "last_update_id": uid,
+            })
+        return records
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Registry
 # ──────────────────────────────────────────────────────────────────────────
 
 _EXCHANGES = {
     "binance": BinanceExchange,
     "coinbase": CoinbaseExchange,
+    "okx": OKXExchange,
+    "kraken": KrakenExchange,
+    "bybit": BybitExchange,
 }
 
 
@@ -342,4 +819,3 @@ def get_exchange(name: str) -> Exchange:
 
 def available_exchanges() -> List[str]:
     return sorted(_EXCHANGES)
-

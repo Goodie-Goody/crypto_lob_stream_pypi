@@ -159,7 +159,7 @@ def _add_stream_args(p: argparse.ArgumentParser):
     p.add_argument(
         "--exchange",
         default="binance",
-        help="Exchange to stream from: binance (default) or coinbase",
+        help="Exchange to stream from: binance (default), coinbase, okx, kraken, or bybit",
     )
     p.add_argument(
         "--output",

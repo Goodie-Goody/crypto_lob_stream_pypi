@@ -295,11 +295,30 @@ class LOBStreamer:
                     heartbeat_task = asyncio.create_task(heartbeat())
 
                     async for message in ws:
-                        raw = json.loads(message)
+                        # Some exchanges (OKX) send a literal "pong" or expect
+                        # "ping" text frames; ignore non-JSON control frames.
+                        if message == "pong" or message == "ping":
+                            continue
+                        try:
+                            raw = json.loads(message)
+                        except (ValueError, TypeError):
+                            continue
 
-                        # Handle socket-delivered snapshots (e.g. Coinbase level2)
-                        if raw.get("type") == "snapshot":
-                            asset = raw.get("product_id", "").upper()
+                        # Ignore subscription acks / errors / control frames
+                        if isinstance(raw, dict):
+                            # OKX-style event acks
+                            if raw.get("event") in ("subscribe", "error"):
+                                continue
+                            # Kraken-style method acks (subscribe/unsubscribe)
+                            if "method" in raw and "data" not in raw:
+                                continue
+                            # Kraken heartbeat/status channels carry no book/trade data
+                            if raw.get("channel") in ("heartbeat", "status"):
+                                continue
+
+                        # Handle socket-delivered snapshots (Coinbase, OKX)
+                        if self.exchange.is_socket_snapshot(raw):
+                            asset = self.exchange.socket_snapshot_asset(raw)
                             if asset and asset not in self._snapshot_taken:
                                 self._store_socket_snapshot(asset, raw)
                                 self._snapshot_taken.add(asset)
@@ -339,4 +358,3 @@ class LOBStreamer:
             asyncio.run(self._stream())
         except KeyboardInterrupt:
             print("\nStopped. Final buffers flushed.")
-            
