@@ -1,8 +1,16 @@
 # crypto-lob-stream
 
-Stream Binance Level 2 order book and trade data to local disk or Google Cloud Storage.
+Stream Level 2 order book and trade data from major crypto exchanges to local disk or Google Cloud Storage, in analysis-ready Parquet.
 
-High-quality, granular LOB data is difficult to access openly. Most sources are paywalled, time-limited, or never publicly released. This package makes it easy for anyone to collect continuous, fully reconstructable order book and trade data for any Binance pair and store it in an open, analysis-ready format. Monthly snapshots are published freely on [Hugging Face](https://huggingface.co/) for the research community.
+**Supported exchanges:** Binance, Coinbase, OKX, Kraken, Bybit.
+
+## Why this exists
+
+High-quality, granular limit order book data is one of the biggest barriers to entry in high-frequency and microstructure research. For most markets the full depth-of-book feed is paywalled, licensed, time-limited, or never released publicly at all, which puts serious order-book research out of reach for independent researchers, students, and small teams.
+
+Crypto is the exception. The major crypto exchanges publish full L2 order book and trade data over free, public WebSocket feeds. This package puts a single, consistent interface in front of five of them, so anyone can collect continuous, fully reconstructable order book data with one command and store it in an open format. The goal is simple: lower the data barrier for high-frequency and market-microstructure research, at least in the one asset class where the raw feeds are genuinely open.
+
+As a contribution back to the community, monthly snapshots of BTC, ETH, and SOL order book data (collected from Binance) are published freely on [Hugging Face](https://huggingface.co/).
 
 ---
 
@@ -31,24 +39,49 @@ from crypto_lob_stream import LOBStreamer
 
 streamer = LOBStreamer(
     assets=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    exchange="binance",
     output="local",
     output_dir="./lob_data",
 )
 streamer.run()
 ```
 
-### Stream to GCS
+### Pick an exchange
+
+Each exchange uses its own native symbol format, but the package normalises automatically, so you can pass any common form and it converts to the right one.
 
 ```python
-streamer = LOBStreamer(
-    assets=["BTCUSDT"],
-    output="gcs",
-    bucket="my-gcs-bucket",
-)
-streamer.run()
+# Coinbase  (BTC-USD)
+LOBStreamer(assets=["BTC-USD"], exchange="coinbase", output_dir="./data").run()
+
+# OKX  (BTC-USDT)
+LOBStreamer(assets=["BTC-USDT"], exchange="okx", output_dir="./data").run()
+
+# Kraken  (BTC/USD)
+LOBStreamer(assets=["BTC/USD"], exchange="kraken", output_dir="./data").run()
+
+# Bybit  (BTCUSDT)
+LOBStreamer(assets=["BTCUSDT"], exchange="bybit", output_dir="./data").run()
 ```
 
+### CLI
+
+```bash
+# Binance (default)
+crypto-lob-stream --assets BTCUSDT,ETHUSDT --output-dir ./data
+
+# Another exchange
+crypto-lob-stream --assets BTC-USD --exchange coinbase --output-dir ./data
+
+# Custom flush interval (seconds)
+crypto-lob-stream --assets BTCUSDT --exchange bybit --flush-interval 60 --output-dir ./data
+```
+
+Press Ctrl+C to stop cleanly. Parquet files start landing within a few minutes.
+
 ### Real-time callback
+
+Hook into every trade or depth event as it arrives, for live monitoring or piping into your own sink:
 
 ```python
 def on_trade(record):
@@ -56,73 +89,26 @@ def on_trade(record):
 
 streamer = LOBStreamer(
     assets=["BTCUSDT"],
+    exchange="binance",
     output="local",
     on_trade=on_trade,
 )
 streamer.run()
 ```
 
-### CLI
-
-```bash
-# Local
-crypto-lob-stream --assets BTCUSDT,ETHUSDT --output local --output-dir ./data
-
-# GCS (after running setup)
-crypto-lob-stream --assets BTCUSDT,ETHUSDT,SOLUSDT --output gcs
-
-# Custom flush interval (seconds)
-crypto-lob-stream --assets BTCUSDT --output local --flush-interval 60
-```
-
 ---
 
-## GCS setup
+## Supported exchanges
 
-If you want to stream to Google Cloud Storage, run the setup wizard once before your first stream. It saves your credentials so you never have to configure them again.
+| Exchange | `exchange=` | Symbol format | Snapshot source |
+|---|---|---|---|
+| Binance | `binance` | `BTCUSDT` | REST |
+| Coinbase | `coinbase` | `BTC-USD` | WebSocket |
+| OKX | `okx` | `BTC-USDT` | WebSocket |
+| Kraken | `kraken` | `BTC/USD` | WebSocket |
+| Bybit | `bybit` | `BTCUSDT` | WebSocket |
 
-### Step 1 -- Create a GCS bucket
-
-Go to [console.cloud.google.com](https://console.cloud.google.com), create a project, and create a bucket in your preferred region.
-
-### Step 2 -- Create a service account
-
-In the GCP Console, go to IAM & Admin > Service Accounts. Create a new service account, assign it the **Storage Object Admin** role on your bucket, and download the JSON key file.
-
-### Step 3 -- Run the setup wizard
-
-```bash
-crypto-lob-stream setup
-```
-
-You will be prompted for your bucket name and the path to your JSON key file:
-
-```
-crypto-lob-stream -- GCS Setup
-----------------------------------
-GCS bucket name: my-bucket
-Path to service account JSON key: ~/Downloads/my-key.json
-
-Saved config to ~/.crypto_lob_stream/config.json
-Testing connection to gs://my-bucket ... OK
-
-Setup complete. You can now run:
-  crypto-lob-stream --assets BTCUSDT,ETHUSDT --output gcs
-```
-
-Config is saved to `~/.crypto_lob_stream/config.json`. From this point on, just run with `--output gcs` and credentials are applied automatically.
-
-### Check saved config
-
-```bash
-crypto-lob-stream config
-```
-
-### Override credentials per run
-
-```bash
-crypto-lob-stream --assets BTCUSDT --output gcs --bucket other-bucket --credentials /path/to/other-key.json
-```
+Symbols are normalised per exchange, so `BTCUSDT`, `BTC-USDT`, and `BTC/USDT` all resolve to the correct native form for whichever exchange you choose.
 
 ---
 
@@ -135,7 +121,7 @@ crypto-lob-stream --assets BTCUSDT --output gcs --bucket other-bucket --credenti
   snapshots/{asset}/YYYY-MM-DD-HHmmss.parquet
 ```
 
-All files are Snappy-compressed Parquet. Files are flushed to disk or uploaded to GCS every 5 minutes by default.
+All files are Snappy-compressed Parquet, flushed every 5 minutes by default (configurable with `--flush-interval`). Each exchange keeps its native symbol format in the folder path, so streaming the same pair from multiple exchanges never collides.
 
 ---
 
@@ -146,56 +132,72 @@ All files are Snappy-compressed Parquet. Files are flushed to disk or uploaded t
 | Field | Type | Notes |
 |---|---|---|
 | timestamp_ms | int64 | Event time (Unix ms) |
-| asset | string | e.g. BTCUSDT |
-| trade_id | int64 | Binance trade ID |
+| asset | string | Native symbol, e.g. BTCUSDT |
+| trade_id | int64 | Exchange trade ID (UUID-based IDs are hashed to a stable int) |
 | price | float64 | |
 | quantity | float64 | |
-| buyer_maker | bool | True if the buyer is the market maker |
+| buyer_maker | bool | True if the buyer was the maker |
 
 ### depth (diff events)
 
 | Field | Type | Notes |
 |---|---|---|
-| timestamp_ms | int64 | Receipt time (Unix ms) |
+| timestamp_ms | int64 | Event/receipt time (Unix ms) |
 | asset | string | |
 | side | string | bid or ask |
 | price | float64 | |
 | quantity | float64 | 0.0 means the level was removed |
-| first_update_id | int64 | `U` field from Binance diff event |
-| last_update_id | int64 | `u` field -- sequence number for replay ordering |
+| first_update_id | int64 | Sequence start (exchange-specific; falls back to timestamp where no sequence id exists) |
+| last_update_id | int64 | Sequence number for replay ordering |
 
 ### snapshots
 
 | Field | Type | Notes |
 |---|---|---|
-| timestamp_ms | int64 | Fetch time (Unix ms) |
+| timestamp_ms | int64 | Snapshot time (Unix ms) |
 | asset | string | |
 | side | string | bid or ask |
 | price | float64 | |
 | quantity | float64 | |
-| last_update_id | int64 | REST snapshot `lastUpdateId` -- anchor for diff replay |
+| last_update_id | int64 | Snapshot anchor for diff replay |
 
-A REST snapshot is fetched from Binance (1000 levels per side) immediately after every WebSocket connection, including reconnects. This ensures there is always a valid anchor point for book reconstruction.
+A snapshot is captured at the start of every connection (and after reconnects). Binance fetches it via REST; the other exchanges deliver it over the WebSocket. Either way it gives a valid anchor point for book reconstruction.
 
 ---
 
 ## LOB reconstruction
 
-To reconstruct the full order book at any point in time from stored data:
+To reconstruct the full order book at a point in time:
 
-1. Load the nearest `snapshots/` file whose `timestamp_ms` precedes your target window. The `last_update_id` column is the snapshot anchor.
-2. Discard all depth diff rows where `last_update_id <= snapshot_last_update_id`.
-3. Verify the first retained diff satisfies `first_update_id <= snapshot_last_update_id + 1`. If not, a gap exists -- use the next available snapshot.
-4. Apply diffs in ascending `last_update_id` order. For each price level, set quantity to the diff value. Remove the level if `quantity == 0.0`.
+1. Load the nearest `snapshots/` file whose `timestamp_ms` precedes your target window. Its `last_update_id` is the anchor.
+2. Discard depth diff rows at or before the snapshot anchor.
+3. Apply remaining diffs in ascending `last_update_id` order. For each price level, set the quantity to the diff value, and remove the level when quantity is 0.0.
 
-To detect the schema version programmatically:
+For exchanges that expose true sequence ids (Binance, OKX, Bybit), the update ids give exact ordering and gap detection. For exchanges that don't (Coinbase, Kraken), the message timestamp is used as the ordering key.
 
-```python
-import pyarrow.parquet as pq
+---
 
-schema = pq.read_schema("depth/btcusdt/2026-06-03-15.parquet")
-is_reconstructable = "last_update_id" in schema.names
+## Advanced: streaming to Google Cloud Storage
+
+For long-running collection on a server you can stream directly to a GCS bucket. This is optional and needs the `gcs` extra:
+
+```bash
+pip install crypto-lob-stream[gcs]
 ```
+
+Run the one-time setup wizard, which saves your bucket and service-account key path:
+
+```bash
+crypto-lob-stream setup
+```
+
+Then stream to the cloud:
+
+```bash
+crypto-lob-stream --assets BTCUSDT --exchange binance --output gcs
+```
+
+Config is saved to `~/.crypto_lob_stream/config.json`, so credentials apply automatically on later runs. Check it with `crypto-lob-stream config`, or override per run with `--bucket` and `--credentials`.
 
 ---
 
@@ -203,33 +205,42 @@ is_reconstructable = "last_update_id" in schema.names
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| assets | list[str] | required | Binance symbols, e.g. `["BTCUSDT", "ETHUSDT"]` |
+| assets | list[str] | required | Symbols; normalised per exchange |
+| exchange | str | `"binance"` | binance, coinbase, okx, kraken, or bybit |
 | output | str | `"local"` | `"local"` or `"gcs"` |
 | output_dir | str | `"./lob_data"` | Base directory for local output |
-| bucket | str | None | GCS bucket name (required for GCS output if not saved via setup) |
-| fallback_dir | str | `"./lob_fallback"` | Local directory for failed GCS uploads |
+| bucket | str | None | GCS bucket (required when output="gcs") |
 | flush_interval | int | `300` | Seconds between buffer flushes |
-| on_trade | callable | None | Optional callback invoked per trade record |
-| on_depth | callable | None | Optional callback invoked per depth record |
+| on_trade | callable | None | Optional callback per trade record |
+| on_depth | callable | None | Optional callback per depth record |
 | log_dir | str | `"./logs"` | Directory for rotating log files |
 
 ---
 
 ## Data limitations
 
-Depth files collected before **2026-06-03 14:38:49 UTC** do not contain `first_update_id` or `last_update_id` and cannot be used for LOB reconstruction. They may still be useful for analysing the distribution of price-level updates and trade activity. Files from that timestamp onward are fully reconstructable.
+Binance depth files collected before **2026-06-03 14:38:49 UTC** do not contain sequence ids and cannot be used for full reconstruction. Files from that point onward, and all data from the other exchanges, are fully reconstructable.
 
 ---
 
 ## Hugging Face dataset
 
-Monthly snapshots of data collected by this package are published at [Hugging Face](https://huggingface.co/) for free public use. Each release includes a dataset card noting the schema cutoff date and any known gaps.
+Monthly snapshots of BTC, ETH, and SOL order book and trade data, collected from Binance with this package, are published freely on Hugging Face as a contribution to the open-source research community. Multi-exchange dataset releases are planned.
+
+---
+
+## Roadmap
+
+- Additional crypto venues
+- AWS S3 output target
+- Multiple exchanges within a single streamer process
+- FX and equity venues are being explored, where data licensing permits (note: unlike crypto, full depth-of-book equity data is generally licensed and cannot be freely redistributed, so coverage there will be limited)
 
 ---
 
 ## Contributing
 
-Issues and pull requests are welcome. If you add support for a new exchange or output target, please include tests.
+Issues and pull requests are welcome. Adding a new exchange means implementing one adapter class against the `Exchange` interface in `exchanges.py`; please include tests. The existing five adapters are worked examples.
 
 ---
 
