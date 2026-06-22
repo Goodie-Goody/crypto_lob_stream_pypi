@@ -6,9 +6,11 @@ Stream Level 2 order book and trade data from major crypto exchanges to local di
 
 ## Why this exists
 
-High-quality, granular limit order book data is one of the biggest barriers to entry in high-frequency and microstructure research. For most markets the full depth-of-book feed is paywalled, licensed, time-limited, or never released publicly at all, which puts serious order-book research out of reach for independent researchers, students, and small teams.
+High-quality, granular limit order book data is one of the biggest barriers to entry in high-frequency and microstructure research. For most markets the full depth-of-book feed is behind a paywall, licensed, time-limited, or never released publicly at all, which puts serious order-book research out of reach for many independent researchers, students, and small teams that cannot afford the resources required to surmount these challenges.
 
-Crypto is the exception. The major crypto exchanges publish full L2 order book and trade data over free, public WebSocket feeds. This package puts a single, consistent interface in front of several of them, so anyone can collect continuous, fully reconstructable order book data with one command (or several, concurrently, in one process) and store it in an open format. The goal is simple: lower the data barrier for high-frequency and market-microstructure research, at least in the one asset class where the raw feeds are genuinely open.
+I experienced it as well, which is where the motivation to build this came from.
+
+The focus on Crypto is due to its unique exception compared to other equities: The major crypto exchanges publish full L2 order book and trade data over free, public WebSocket feeds. This package puts a single, consistent interface in front of several of them, so anyone can collect continuous, fully reconstructable order book data with one command (or several, concurrently, in one process) and store it in an open format. The goal is simple: lower the data barrier for high-frequency and market-microstructure research, at least in the one asset class where the raw feeds are genuinely open.
 
 As a contribution back to the community, monthly snapshots of BTC, ETH, and SOL order book data (collected from Binance) are published freely on [Hugging Face](https://huggingface.co/).
 
