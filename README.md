@@ -108,7 +108,7 @@ LOBStreamer(assets=["BTCUSDT"], exchange="bybit", output_dir="./data").run()
 
 ### Futures / perpetuals
 
-Three adapters cover USDT-margined (or USDⓢ-M) perpetual contracts: `binance_futures`, `okx_swap`, `bybit_linear`. Each adds a `funding/` Parquet table (mark price, funding rate, next funding time) alongside the usual `trades/`/`depth/` tables:
+Three adapters cover USDT-margined (or USDⓢ-M) perpetual contracts: `binance_futures`, `okx_swap`, `bybit_linear`. Each adds three Parquet tables alongside the usual `trades/`/`depth/` ones: `funding/` (mark price, funding rate, next funding time), `liquidations/` (forced position closures), and `open_interest/` (total outstanding leveraged exposure) — together, the standard set for studying leverage and liquidity stress:
 
 ```python
 LOBStreamer(assets=["BTCUSDT"], exchange="binance_futures", output_dir="./futures_data").run()
@@ -173,9 +173,11 @@ streamer.run()
   trades/{exchange}/{asset}/YYYY-MM-DD-HH.parquet
   depth/{exchange}/{asset}/YYYY-MM-DD-HH.parquet
   snapshots/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
-  gaps/{exchange}/{asset}/YYYY-MM-DD-HH.parquet        # only written when a gap is detected
-  checksums/{exchange}/{asset}/YYYY-MM-DD-HH.parquet   # only written on a mismatch
-  funding/{exchange}/{asset}/YYYY-MM-DD-HH.parquet     # futures/perps only
+  gaps/{exchange}/{asset}/YYYY-MM-DD-HH.parquet            # only written when a gap is detected
+  checksums/{exchange}/{asset}/YYYY-MM-DD-HH.parquet       # only written on a mismatch
+  funding/{exchange}/{asset}/YYYY-MM-DD-HH.parquet         # futures/perps only
+  liquidations/{exchange}/{asset}/YYYY-MM-DD-HH.parquet    # futures/perps only
+  open_interest/{exchange}/{asset}/YYYY-MM-DD-HH.parquet   # futures/perps only
 ```
 
 All files are Snappy-compressed Parquet, flushed every 5 minutes by default (configurable with `--flush-interval`). Output is always partitioned by exchange first, then asset, so running multiple exchanges never collides, even for the same symbol on two different exchanges.
@@ -259,18 +261,101 @@ Matches are not written (that would be a row per update); only mismatches are pe
 | funding_rate | float64 | |
 | next_funding_ms | int64 | Next funding settlement time (Unix ms) |
 
+### liquidations (futures/perps only)
+
+| Field | Type | Notes |
+|---|---|---|
+| timestamp_ms | int64 | Event time (Unix ms) |
+| exchange | string | |
+| asset | string | |
+| side | string | Side of the liquidated position |
+| price | float64 | |
+| quantity | float64 | |
+
+Every row is a forced position closure — the most direct real-time signal of leveraged positions getting stretched, the actual stress event rather than just a precursor to one.
+
+### open_interest (futures/perps only)
+
+| Field | Type | Notes |
+|---|---|---|
+| timestamp_ms | int64 | Event/poll time (Unix ms) |
+| exchange | string | |
+| asset | string | |
+| open_interest | float64 | Total outstanding contracts/base currency |
+| open_interest_value | float64 | In quote currency (e.g. USD), where the exchange provides it. `None` for `binance_futures` — see "Known limitations" |
+
+Liquidations are the fire; open interest is the fuel — the two are meant to be read together for stress research, not separately.
+
 ---
 
 ## LOB reconstruction
 
-To reconstruct the full order book at a point in time:
+A snapshot is the full book frozen at one instant. A diff is one change since the last message: a price level's size went up, went down, or the level disappeared entirely. Replaying a snapshot plus every diff after it, in order, rebuilds the book at any point in between — that's the entire idea. Diffs are used instead of repeatedly re-sending a full snapshot because almost every update only touches one or two price levels; re-sending hundreds of unchanged levels every time would be enormously wasteful.
+
+Reconstruct each exchange's book separately — never merge order books across exchanges. Binance's BTC/USDT and Kraken's BTC/USD are different markets with different participants and can briefly disagree on price; there's no single combined ladder to merge them into. Cross-exchange analysis means comparing books side by side, not collapsing them into one.
+
+### The ghost-level problem
+
+Every exchange in this package signals removal only one way: a diff explicitly setting a price level's quantity to `0`. None of them tell you when a level has simply drifted outside whatever depth you intend to track — it just stops sending updates for that price, and "nothing changed" looks identical to "this fell out of scope." A naive replay (apply every diff, remove only on `quantity == 0`) accumulates these **ghost levels** indefinitely: price levels that are no longer real but were never explicitly zeroed.
+
+This isn't a quirk of one exchange. [An independent 25-hour test against Binance](https://dev.to/oliverzehentleitner) (gap-free, sequence-validated, no pruning) ended with 20,758 tracked bid levels against a real ~1,000-level book — only 24% still matched reality. The fix in both his case and ours is the same: after every update, actively prune the book back to the depth you intend to maintain, rather than waiting for the exchange to tell you when a level should be dropped — for a level that's merely fallen out of scope, it never will. This is the exact bug already found and fixed in this package's own Kraken checksum mirror (see "Data integrity" above); `reconstruct.py` applies the identical fix generally, for anyone reconstructing from any exchange's data.
+
+How exposed each exchange is depends on how narrow its tracked window is — narrower means drift happens more often, not "doesn't happen." Worth separating two genuinely different situations here: some of these numbers are hard ceilings the exchange itself enforces; others are just a depth this package happened to choose, which the underlying live stream isn't actually restricted to.
+
+| Exchange | What's actually captured | Is the ceiling exchange-enforced? |
+|---|---|---|
+| Kraken | `depth: 25` | Yes — a subscription parameter; the exchange will never send level 26 |
+| Bybit / Bybit linear | `orderbook.50` | Yes — same idea, baked into the subscribed topic name |
+| OKX / OKX swap | `books` channel | Yes — confirmed via OKX's own docs: the channel itself is a fixed 400 levels, not something we requested |
+| Binance / Binance Futures | REST snapshot requested at 1000 | **No** — 1000 is a depth *we* chose for the snapshot call; the live diff stream itself isn't capped, so without pruning the book can genuinely drift past 1000 over time |
+| Coinbase | `level2_batch`, full book | No known ceiling documented anywhere — there's no number to enforce |
+
+This applies identically across spot and futures — it's a property of the snapshot-plus-diff protocol shape every adapter shares, not something tied to market type.
+
+### Using the built-in reconstruction helper
+
+```python
+from crypto_lob_stream import reconstruct
+
+book = reconstruct("./lob_data", exchange="kraken", asset="BTC/USD")
+bids, asks = book.top(n=10)   # best 10 levels per side, correctly pruned
+```
+
+`reconstruct()` loads the most recent snapshot plus every depth diff after it from your output directory, replays them, and returns a `BookReconstructor` already pruned to a sensible default depth for that exchange (the table above). Pass `max_depth=` to override it; pass `max_depth=None` to disable pruning entirely (not recommended, for the reasons above). Requesting a depth deeper than what was actually captured — e.g. more than 25 for Kraken, more than 50 for Bybit/Bybit linear — can't recover data that was never subscribed to; `book.top(n=...)` returns whatever depth is actually available in that case, and raises a `UserWarning` naming the exchange, its real captured depth, and a link back to this section, rather than silently handing back fewer rows than you asked for with no explanation.
+
+This operates entirely offline, on Parquet files already on disk. It doesn't run live or connect to any exchange — that's a deliberate scope boundary, not an oversight: a live, continuously-maintained in-memory book is a different job (one ccxt.pro already does), and this package is about capturing the event stream, not maintaining a live one.
+
+### Manual reconstruction
+
+If you're not using Python, or want full control over the replay:
 
 1. Load the nearest `snapshots/` file whose `timestamp_ms` precedes your target window. Its `last_update_id` is the anchor.
 2. Discard depth diff rows at or before the snapshot anchor.
-3. Apply remaining diffs in ascending `last_update_id` order. For each price level, set the quantity to the diff value, and remove the level when quantity is 0.0.
-4. Cross-check against `gaps/` for that exchange/asset — any gap row covering your window means a contiguous diff sequence isn't available across that point. Treat the gap as a hard reset rather than reconstructing across it; a fresh snapshot is written immediately after every detected gap where `resync_on_gap=True` and a REST endpoint exists.
+3. Apply remaining diffs in ascending `last_update_id` order. Each diff's `quantity` is the level's new total size, not a delta — set it directly, and remove the level when `quantity` is `0.0`.
+4. **After every update, prune back to your intended depth.** This step is the fix for the ghost-level problem above — without it, you will reproduce it.
+5. Cross-check against `gaps/` for that exchange/asset — any gap row covering your window means a contiguous diff sequence isn't available across that point. Treat the gap as a hard reset rather than reconstructing across it; a fresh snapshot is written immediately after every detected gap where `resync_on_gap=True` and a REST endpoint exists.
 
 For exchanges with true sequence ids, the update ids give exact ordering and gap detection. For Coinbase and Kraken, the message timestamp is the ordering key, and Kraken's checksum table (if run with `verify_checksums=True`) is the integrity signal to check instead.
+
+---
+
+## Compacting Parquet files
+
+By default, every `flush_interval` (5 minutes) produces a new small Parquet file. Over months of continuous capture that becomes tens of thousands of tiny files per exchange/asset — slow to query and slow to even list, especially in cloud storage where each file open carries real latency. This is a separate concern from reconstruction above: it's pure file consolidation, doesn't touch a single row of data, and is worth doing whether or not you ever reconstruct anything.
+
+```python
+from crypto_lob_stream import compact, compact_tree
+
+# One (prefix, exchange, asset) leaf at a time:
+compact("lob_data/depth/binance/BTCUSDT",
+        "lob_data_compacted/depth/binance/BTCUSDT",
+        granularity="month")
+
+# Or the whole output_dir at once:
+compact_tree("lob_data", "lob_data_compacted", granularity="month")
+```
+
+`granularity` is `"day"`, `"week"`, `"month"`, or `"year"` — pick whatever matches how you'll actually query the data later. Pass `delete_source=True` once you trust the result, to remove the small originals after merging; it defaults to `False` so the first run is non-destructive.
 
 ---
 
@@ -297,6 +382,7 @@ Config is saved to `~/.crypto_lob_stream/config.json`, so credentials apply auto
 | output_dir | str | `"./lob_data"` | Base directory for local output |
 | bucket | str | None | GCS bucket (required when output="gcs") |
 | flush_interval | int | `300` | Seconds between buffer flushes |
+| open_interest_poll_interval | int | `30` | Seconds between open-interest polls, for exchanges with no WebSocket push for it (currently only `binance_futures`; has no effect for `okx_swap`/`bybit_linear`, which get it via their existing WebSocket channels) |
 | on_trade | callable | None | Optional callback per trade record |
 | on_depth | callable | None | Optional callback per depth record |
 | on_gap | callable | None | Optional callback per detected gap |
@@ -310,7 +396,12 @@ Config is saved to `~/.crypto_lob_stream/config.json`, so credentials apply auto
 
 ## Known limitations
 
+- Binance depth files collected before **2026-06-03 14:38:49 UTC** do not contain sequence ids and cannot be used for full reconstruction.
 - `okx_swap` funding records have `mark_price=None` by design — a real value requires also subscribing to OKX's separate `mark-price` channel, which isn't wired up yet.
+- `binance_futures` open-interest records have `open_interest_value=None` — Binance's REST endpoint provides a contract count but not a USD value (OKX and Bybit linear both provide one, since their open-interest data already carries it).
+- OKX swap's `open-interest` channel payload fields (`oi`, `oiUsd`) are assumed to mirror OKX's confirmed REST response shape, per OKX's general consistency between REST and WS field naming — the WS push itself wasn't separately confirmed against a live connection. If `oiUsd` is ever absent in practice, `open_interest_value` will just come through as `None` rather than raising, but this is one to watch on first live run.
+- `binance_futures` open interest is REST-polled (default every 30s, see `open_interest_poll_interval`), not pushed over WebSocket — confirmed there is no such push stream at all on Binance Futures, not just an oversight here (even Tardis.dev, a professional data vendor, polls the identical REST endpoint themselves).
+- `reconstruct()` is opt-in, not automatic — the raw depth data is captured faithfully as-is, and nothing prunes it for you unless you call `reconstruct()` (or implement the pruning step yourself; see "LOB reconstruction" above). Querying raw `depth/` files directly without reconstruction risks exactly the ghost-level problem described there.
 - Auto-resync-on-gap only works for REST-snapshot exchanges (Binance, Binance Futures). OKX/Bybit-family exchanges log and record the gap but need a full reconnect to get a fresh socket-delivered snapshot.
 - A genuine exchange-side gap hasn't yet been observed in live testing; the detection logic itself is validated via synthetic/mocked sequence breaks (`tests/test_integration_mocked.py`).
 - Multi-exchange mode (`exchanges=`) runs each exchange as an independent task in one process/event loop. One exchange's connection trouble doesn't affect the others, but a process-level crash takes every feed down together. For full fault isolation, separate processes per exchange are still the safer choice.
@@ -329,6 +420,7 @@ Monthly snapshots of BTC, ETH, and SOL order book and trade data, collected from
 ## Roadmap
 
 - OKX mark price for `okx_swap` funding records
+- Live confirmation of OKX swap's `open-interest` WS push field names (currently assumed from REST, see "Known limitations")
 - Auto-resync-on-gap for socket-snapshot exchanges (OKX, Bybit) without requiring a full reconnect
 - Dated/quarterly futures contracts
 - Additional spot venues

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from crypto_lob_stream import LOBStreamer
 
@@ -398,3 +400,118 @@ def test_bybit_consecutive_real_messages_not_falsely_flagged_as_gap():
         s._ingest(exch.name, exch, record)
 
     assert s._gap_buffer.get("bybit_linear:BTCUSDT", []) == []
+
+
+# ── Liquidations & open interest ─────────────────────────────────────────────
+
+def test_ingest_liquidation_record():
+    s = LOBStreamer(exchange="binance_futures", assets=["BTCUSDT"], output="local")
+    s._ingest("binance_futures", s.exchange, {
+        "type": "liquidation", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "sell", "price": 65000.0, "quantity": 0.5,
+    })
+    liqs = s._liquidation_buffer["binance_futures:BTCUSDT"]
+    assert len(liqs) == 1
+    assert liqs[0]["side"] == "sell"
+    assert liqs[0]["exchange"] == "binance_futures"
+
+
+def test_ingest_open_interest_record():
+    s = LOBStreamer(exchange="binance_futures", assets=["BTCUSDT"], output="local")
+    s._ingest("binance_futures", s.exchange, {
+        "type": "open_interest", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "open_interest": 10000.0, "open_interest_value": None,
+    })
+    oi = s._open_interest_buffer["binance_futures:BTCUSDT"]
+    assert len(oi) == 1
+    assert oi[0]["open_interest"] == 10000.0
+    assert oi[0]["open_interest_value"] is None
+
+
+def test_liquidation_and_open_interest_flush_to_parquet(tmp_path):
+    s = LOBStreamer(exchange="bybit_linear", assets=["BTCUSDT"], output="local",
+                     output_dir=str(tmp_path), flush_interval=9999)
+    s._ingest("bybit_linear", s.exchange, {
+        "type": "liquidation", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "buy", "price": 1.0, "quantity": 1.0,
+    })
+    s._ingest("bybit_linear", s.exchange, {
+        "type": "open_interest", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "open_interest": 1.0, "open_interest_value": 2.0,
+    })
+    s._flush(force=True)
+
+    import pyarrow.parquet as pq
+    liq_files = list((tmp_path / "liquidations" / "bybit_linear" / "BTCUSDT").glob("*.parquet"))
+    oi_files = list((tmp_path / "open_interest" / "bybit_linear" / "BTCUSDT").glob("*.parquet"))
+    assert len(liq_files) == 1
+    assert len(oi_files) == 1
+    assert pq.read_table(str(liq_files[0])).num_rows == 1
+    assert pq.read_table(str(oi_files[0])).num_rows == 1
+
+
+def test_poll_open_interest_loop_noops_for_exchanges_without_rest_polling():
+    # okx_swap and bybit_linear get open interest via WebSocket, not
+    # REST -- the poll loop should return immediately rather than
+    # spin forever doing nothing.
+    s = LOBStreamer(exchange="okx_swap", assets=["BTC-USDT"], output="local")
+    result = asyncio.run(
+        asyncio.wait_for(s._poll_open_interest_loop(s.feeds[0]), timeout=1.0)
+    )
+    assert result is None  # returned (didn't hang) because nothing needs polling
+
+
+def test_poll_open_interest_loop_polls_binance_futures(monkeypatch):
+    s = LOBStreamer(
+        exchange="binance_futures", assets=["BTCUSDT"], output="local",
+        open_interest_poll_interval=0,
+    )
+
+    calls = []
+
+    async def fake_poll(exch, asset):
+        calls.append(asset)
+        if len(calls) >= 2:
+            raise asyncio.CancelledError()  # stop the infinite loop cleanly
+
+    monkeypatch.setattr(s, "_poll_open_interest", fake_poll)
+
+    async def run():
+        try:
+            await s._poll_open_interest_loop(s.feeds[0])
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    assert calls == ["BTCUSDT", "BTCUSDT"]
+
+
+def test_poll_open_interest_fetches_and_ingests(monkeypatch):
+    s = LOBStreamer(exchange="binance_futures", assets=["BTCUSDT"], output="local")
+
+    class FakeResp:
+        status = 200
+        async def json(self):
+            return {"symbol": "BTCUSDT", "openInterest": "123.45", "time": 1}
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        def get(self, url, timeout=None):
+            return FakeResp()
+
+    monkeypatch.setattr(
+        "crypto_lob_stream.streamer.aiohttp.ClientSession", lambda: FakeSession()
+    )
+
+    asyncio.run(s._poll_open_interest(s.exchange, "BTCUSDT"))
+
+    oi = s._open_interest_buffer["binance_futures:BTCUSDT"]
+    assert len(oi) == 1
+    assert oi[0]["open_interest"] == 123.45

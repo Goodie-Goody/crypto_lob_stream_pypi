@@ -67,3 +67,25 @@ FUNDING_SCHEMA = pa.schema([
     ("funding_rate",     pa.float64()),
     ("next_funding_ms",  pa.int64()),
 ])
+
+# Futures/perps only. Every liquidation = a forced position closure, the
+# clearest direct signal of leveraged positions getting stretched.
+LIQUIDATION_SCHEMA = pa.schema([
+    ("timestamp_ms", pa.int64()),
+    ("exchange",     pa.string()),
+    ("asset",        pa.string()),
+    ("side",         pa.string()),    # side of the liquidated position
+    ("price",        pa.float64()),
+    ("quantity",     pa.float64()),
+])
+
+# Futures/perps only. Total outstanding leveraged exposure -- the other
+# half of the stress picture alongside liquidations: open_interest is the
+# fuel, liquidations are the fire.
+OPEN_INTEREST_SCHEMA = pa.schema([
+    ("timestamp_ms",         pa.int64()),
+    ("exchange",             pa.string()),
+    ("asset",                pa.string()),
+    ("open_interest",        pa.float64()),  # in contracts/base currency
+    ("open_interest_value",  pa.float64()),  # in quote currency (e.g. USD), where the exchange provides it
+])

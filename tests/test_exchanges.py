@@ -775,8 +775,9 @@ def test_okx_swap_subscribe_includes_funding_rate_channel():
     okx = OKXSwapExchange()
     msgs = okx.subscribe_messages(["BTC-USDT"])
     channels = {a["channel"] for a in msgs[0]["args"]}
-    assert channels == {"books", "trades", "funding-rate"}
-    assert all(a["instId"] == "BTC-USDT-SWAP" for a in msgs[0]["args"])
+    assert channels == {"books", "trades", "funding-rate", "open-interest", "liquidation-orders"}
+    per_asset_args = [a for a in msgs[0]["args"] if a["channel"] != "liquidation-orders"]
+    assert all(a["instId"] == "BTC-USDT-SWAP" for a in per_asset_args)
 
 
 def test_okx_swap_parses_funding_rate_with_null_mark_price():
@@ -863,3 +864,207 @@ def test_bybit_linear_reuses_spot_orderbook_and_trade_parsing():
     out = byb.parse_message(raw)
     assert out[0]["type"] == "trade"
     assert out[0]["asset"] == "BTCUSDT"
+
+
+# ── Liquidations & open interest (stress-research coverage) ─────────────────
+
+def test_binance_futures_aux_includes_forceorder():
+    bf = BinanceFuturesExchange()
+    aux_url = bf.aux_ws_url(["BTCUSDT"])
+    assert "btcusdt@markPrice@1s" in aux_url
+    assert "btcusdt@forceOrder" in aux_url
+    # Confirmed via Binance's own routed-stream mapping table: forceOrder
+    # is /market, same as markPrice -- both belong on this one connection.
+    assert aux_url.startswith("wss://fstream.binance.com/market/")
+
+
+def test_binance_futures_parses_forceorder_liquidation():
+    bf = BinanceFuturesExchange()
+    raw = {
+        "stream": "btcusdt@forceOrder",
+        "data": {
+            "e": "forceOrder", "E": 1568014460893,
+            "o": {"s": "BTCUSDT", "S": "SELL", "o": "LIMIT", "f": "IOC",
+                   "q": "0.014", "p": "9910", "ap": "9910", "X": "FILLED",
+                   "l": "0.014", "z": "0.014", "T": 1568014460893},
+        },
+    }
+    out = bf.parse_message(raw)
+    assert len(out) == 1
+    assert out[0]["type"] == "liquidation"
+    assert out[0]["asset"] == "BTCUSDT"
+    assert out[0]["side"] == "sell"
+    assert out[0]["price"] == 9910.0
+    assert out[0]["quantity"] == 0.014
+
+
+def test_binance_futures_malformed_forceorder_ignored():
+    bf = BinanceFuturesExchange()
+    raw = {"stream": "btcusdt@forceOrder", "data": {"o": {"s": "BTCUSDT"}}}
+    assert bf.parse_message(raw) == []
+
+
+def test_binance_futures_open_interest_url():
+    bf = BinanceFuturesExchange()
+    assert bf.open_interest_url("BTCUSDT") == (
+        "https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT"
+    )
+
+
+def test_binance_futures_parses_open_interest_rest_response():
+    bf = BinanceFuturesExchange()
+    raw = {"symbol": "BTCUSDT", "openInterest": "10659.509", "time": 1625184323456}
+    out = bf.parse_open_interest("BTCUSDT", raw)
+    assert len(out) == 1
+    assert out[0]["type"] == "open_interest"
+    assert out[0]["open_interest"] == 10659.509
+    assert out[0]["open_interest_value"] is None  # Binance doesn't provide this
+    assert out[0]["timestamp_ms"] == 1625184323456
+
+
+def test_binance_futures_malformed_open_interest_ignored():
+    bf = BinanceFuturesExchange()
+    assert bf.parse_open_interest("BTCUSDT", {"symbol": "BTCUSDT"}) == []
+
+
+def test_okx_swap_subscribes_liquidations_once_per_insttype_not_per_asset():
+    okx = OKXSwapExchange()
+    msgs = okx.subscribe_messages(["BTC-USDT", "ETH-USDT"])
+    liq_args = [a for a in msgs[0]["args"] if a["channel"] == "liquidation-orders"]
+    assert len(liq_args) == 1  # one subscription, not one per asset
+    assert liq_args[0] == {"channel": "liquidation-orders", "instType": "SWAP"}
+
+
+def test_okx_swap_parses_open_interest():
+    okx = OKXSwapExchange()
+    raw = {
+        "arg": {"channel": "open-interest", "instId": "BTC-USDT-SWAP"},
+        "data": [{"instId": "BTC-USDT-SWAP", "instType": "SWAP",
+                   "oi": "14546007", "oiCcy": "14546007000",
+                   "oiUsd": "30921319.84032", "ts": "1728709646117"}],
+    }
+    out = okx.parse_message(raw)
+    assert len(out) == 1
+    assert out[0]["type"] == "open_interest"
+    assert out[0]["asset"] == "BTC-USDT-SWAP"
+    assert out[0]["open_interest"] == 14546007.0
+    assert out[0]["open_interest_value"] == 30921319.84032
+
+
+def test_okx_swap_liquidation_filters_to_tracked_assets_only():
+    okx = OKXSwapExchange()
+    okx.subscribe_messages(["BTC-USDT"])  # populates _tracked_assets
+    raw = {
+        "arg": {"channel": "liquidation-orders", "instType": "SWAP"},
+        "data": [
+            {  # a different symbol we didn't subscribe to -- must be filtered out
+                "instId": "DYDX-USDT-SWAP", "instFamily": "DYDX-USDT", "instType": "SWAP",
+                "uly": "DYDX-USDT",
+                "details": [{"bkLoss": "0", "bkPx": "1.057", "ccy": "",
+                              "posSide": "long", "side": "sell", "sz": "768",
+                              "ts": "1723892524781"}],
+            },
+            {  # the one we actually track
+                "instId": "BTC-USDT-SWAP", "instFamily": "BTC-USDT", "instType": "SWAP",
+                "uly": "BTC-USDT",
+                "details": [{"bkLoss": "0", "bkPx": "65000.0", "ccy": "",
+                              "posSide": "long", "side": "sell", "sz": "0.5",
+                              "ts": "1723892524999"}],
+            },
+        ],
+    }
+    out = okx.parse_message(raw)
+    assert len(out) == 1
+    assert out[0]["asset"] == "BTC-USDT-SWAP"
+    assert out[0]["price"] == 65000.0
+    assert out[0]["quantity"] == 0.5
+    assert out[0]["side"] == "sell"
+
+
+def test_okx_swap_liquidation_without_subscribe_call_filters_everything():
+    # If subscribe_messages was never called, _tracked_assets is empty --
+    # every liquidation gets filtered out rather than crashing.
+    okx = OKXSwapExchange()
+    raw = {
+        "arg": {"channel": "liquidation-orders", "instType": "SWAP"},
+        "data": [{"instId": "BTC-USDT-SWAP",
+                   "details": [{"bkPx": "1", "side": "sell", "sz": "1", "ts": "1"}]}],
+    }
+    assert okx.parse_message(raw) == []
+
+
+def test_bybit_linear_subscribes_allliquidation_not_deprecated_topic():
+    byb = BybitLinearExchange()
+    msgs = byb.subscribe_messages(["BTCUSDT"])
+    assert "allLiquidation.BTCUSDT" in msgs[0]["args"]
+    assert "liquidation.BTCUSDT" not in msgs[0]["args"]  # the deprecated one
+
+
+def test_bybit_linear_parses_allliquidation():
+    byb = BybitLinearExchange()
+    raw = {
+        "topic": "allLiquidation.ROSEUSDT", "type": "snapshot", "ts": 1739502303204,
+        "data": [{"T": 1739502302929, "s": "ROSEUSDT", "S": "Sell",
+                   "v": "20000", "p": "0.04499"}],
+    }
+    out = byb.parse_message(raw)
+    assert len(out) == 1
+    assert out[0]["type"] == "liquidation"
+    assert out[0]["asset"] == "ROSEUSDT"
+    assert out[0]["side"] == "sell"
+    assert out[0]["price"] == 0.04499
+    assert out[0]["quantity"] == 20000.0
+
+
+def test_bybit_linear_allliquidation_batches_multiple_events():
+    byb = BybitLinearExchange()
+    raw = {
+        "topic": "allLiquidation.BTCUSDT", "type": "snapshot", "ts": 1,
+        "data": [
+            {"T": 1, "s": "BTCUSDT", "S": "Sell", "v": "1", "p": "65000"},
+            {"T": 2, "s": "BTCUSDT", "S": "Buy", "v": "2", "p": "65001"},
+        ],
+    }
+    out = byb.parse_message(raw)
+    assert len(out) == 2
+
+
+def test_bybit_linear_tickers_emits_funding_and_open_interest_together():
+    byb = BybitLinearExchange()
+    raw = {
+        "topic": "tickers.BTCUSDT", "type": "snapshot", "ts": 1760325052630,
+        "data": {
+            "symbol": "BTCUSDT", "markPrice": "66666.60",
+            "openInterest": "492373.72", "openInterestValue": "32824881841.75",
+            "fundingRate": "-0.005", "nextFundingTime": "1760342400000",
+        },
+    }
+    out = byb.parse_message(raw)
+    types = {r["type"] for r in out}
+    assert types == {"funding", "open_interest"}
+    funding = next(r for r in out if r["type"] == "funding")
+    oi = next(r for r in out if r["type"] == "open_interest")
+    assert funding["mark_price"] == 66666.60
+    assert oi["open_interest"] == 492373.72
+    assert oi["open_interest_value"] == 32824881841.75
+
+
+def test_bybit_linear_tickers_emits_only_funding_when_oi_fields_absent():
+    byb = BybitLinearExchange()
+    raw = {
+        "topic": "tickers.BTCUSDT", "type": "delta", "ts": 1,
+        "data": {"symbol": "BTCUSDT", "markPrice": "66666.60",
+                  "fundingRate": "-0.005", "nextFundingTime": "1760342400000"},
+    }
+    out = byb.parse_message(raw)
+    assert [r["type"] for r in out] == ["funding"]
+
+
+def test_bybit_linear_tickers_emits_only_open_interest_when_funding_fields_absent():
+    byb = BybitLinearExchange()
+    raw = {
+        "topic": "tickers.BTCUSDT", "type": "delta", "ts": 1,
+        "data": {"symbol": "BTCUSDT", "openInterest": "1.0", "openInterestValue": "2.0"},
+    }
+    out = byb.parse_message(raw)
+    assert [r["type"] for r in out] == ["open_interest"]

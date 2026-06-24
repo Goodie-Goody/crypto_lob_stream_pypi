@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-lob-stream"
-version = "0.7.0"
+version = "0.8.0"
 description = "Stream Level 2 order book and trade data from major crypto exchanges to local disk or GCS."
 readme = "README.md"
 license = "MIT"

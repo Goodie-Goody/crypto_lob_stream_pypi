@@ -127,6 +127,23 @@ class Exchange(ABC):
         aux connection needs different handling."""
         return self.parse_message(raw)
 
+    # -- Open interest (futures/perps only) ---------------------------------
+
+    # REST endpoint for open interest, for exchanges with no WebSocket push
+    # for it at all (currently binance_futures -- confirmed via Binance's
+    # own docs and independently by Tardis.dev, a professional data
+    # vendor, REST-polling the identical endpoint themselves rather than
+    # using a push stream that doesn't exist). Returning "" (default)
+    # means open interest is delivered some other way (a WS channel,
+    # handled in parse_message/parse_aux_message) or not supported.
+    def open_interest_url(self, asset: str) -> str:
+        return ""
+
+    def parse_open_interest(self, asset: str, raw: dict) -> List[dict]:
+        """Parse a REST open-interest response into a normalised record.
+        Only relevant for exchanges where open_interest_url() is non-empty."""
+        return []
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Binance
@@ -537,29 +554,47 @@ class OKXSwapExchange(OKXExchange):
     OKX v5 public WebSocket feed for USDT-margined perpetual swaps (instId
     suffix "-SWAP", e.g. BTC-USDT-SWAP). Same public endpoint, same
     `books`/`trades` channels and message shapes as spot OKX -- just a
-    different instId -- plus an added `funding-rate` channel for a
-    "funding" record type (matching binance_futures).
+    different instId -- plus `funding-rate`, `open-interest`, and
+    `liquidation-orders` channels for "funding"/"open_interest"/
+    "liquidation" record types (matching binance_futures' stress-research
+    coverage).
 
     Differences from OKXExchange (spot):
       - normalize_symbol appends "-SWAP" to the spot-style instId.
-      - subscribe_messages additionally subscribes to `funding-rate` for
-        each instId.
-      - parse_message handles `funding-rate` messages.
+      - subscribe_messages additionally subscribes to `funding-rate` and
+        `open-interest` per instId, and `liquidation-orders` once for the
+        whole SWAP instrument type (see below for why that one's different).
+      - parse_message handles all three.
 
-    mark_price is NOT populated here (left as None). OKX's `funding-rate`
-    channel (fields confirmed via OKX's own SDK source: fundingRate,
-    fundingTime, nextFundingRate, nextFundingTime) doesn't include a mark
-    price -- getting one would mean also subscribing to OKX's separate
-    `mark-price` channel, whose exact push field name wasn't confirmed
-    from documentation in the time available (today already had two
-    bugs -- Kraken's checksum truncation, Binance's routed-path split --
-    that started as a confident-looking guess from docs alone, so this is
-    left as a documented gap rather than a third one). funding_rate and
-    next_funding_ms are solid; mark_price is None for this exchange until
-    that's verified. Recommend validating against a live connection.
+    `liquidation-orders` is subscribed differently from every other
+    channel here: OKX pushes it per `instType` (e.g. all of SWAP), not per
+    instId -- confirmed via a live capture in a ccxt issue thread, where a
+    single subscription to instType=SWAP returned liquidations across
+    many unrelated symbols (DYDX-USDT-SWAP in that example). So this
+    subscribes once for the instrument type, and parse_message filters
+    incoming events down to just the assets this feed actually tracks.
+
+    mark_price is NOT populated in funding records (left as None). OKX's
+    `funding-rate` channel (fields confirmed via OKX's own SDK source:
+    fundingRate, fundingTime, nextFundingRate, nextFundingTime) doesn't
+    include a mark price -- getting one would mean also subscribing to
+    OKX's separate `mark-price` channel, whose exact push field name
+    wasn't confirmed from documentation in the time available (today
+    already had two bugs -- Kraken's checksum truncation, Binance's
+    routed-path split -- that started as a confident-looking guess from
+    docs alone, so this is left as a documented gap rather than a third
+    one). funding_rate/next_funding_ms and the open-interest/liquidation
+    fields below are solid; mark_price is None until verified.
+    Recommend validating against a live connection.
     """
 
     name = "okx_swap"
+
+    def __init__(self):
+        # Populated by subscribe_messages(); used by parse_message to
+        # filter the instType-wide liquidation-orders feed down to just
+        # the assets this feed actually tracks (see class docstring).
+        self._tracked_assets = set()
 
     def normalize_symbol(self, symbol: str) -> str:
         base = super().normalize_symbol(symbol)
@@ -569,9 +604,14 @@ class OKXSwapExchange(OKXExchange):
         args = []
         for a in assets:
             inst = self.normalize_symbol(a)
+            self._tracked_assets.add(inst)
             args.append({"channel": "books", "instId": inst})
             args.append({"channel": "trades", "instId": inst})
             args.append({"channel": "funding-rate", "instId": inst})
+            args.append({"channel": "open-interest", "instId": inst})
+        # Subscribed once for the whole instrument type, not per-asset --
+        # see class docstring.
+        args.append({"channel": "liquidation-orders", "instType": "SWAP"})
         return [{"op": "subscribe", "args": args}]
 
     def parse_message(self, raw: dict) -> List[dict]:
@@ -593,6 +633,52 @@ class OKXSwapExchange(OKXExchange):
                     })
                 except (ValueError, TypeError, KeyError):
                     continue
+            return out
+
+        if channel == "open-interest":
+            # REST payload fields confirmed (instId, instType, oi, oiCcy,
+            # oiUsd, ts); the WS push is assumed to mirror them, per OKX's
+            # general consistency between REST and WS field naming, but
+            # this specific WS shape wasn't separately confirmed against
+            # a live push -- if oiUsd is ever absent in practice,
+            # open_interest_value below will just come through as None
+            # rather than raising.
+            data = raw.get("data", [])
+            out = []
+            for d in data:
+                try:
+                    out.append({
+                        "type":                "open_interest",
+                        "asset":               d.get("instId", "").upper(),
+                        "timestamp_ms":        int(d.get("ts", time.time() * 1000)),
+                        "open_interest":       float(d["oi"]),
+                        "open_interest_value": float(d["oiUsd"]) if "oiUsd" in d else None,
+                    })
+                except (ValueError, TypeError, KeyError):
+                    continue
+            return out
+
+        if channel == "liquidation-orders":
+            # Pushed per instType (e.g. all of SWAP), not per instId --
+            # filter down to just what this feed tracks.
+            data = raw.get("data", [])
+            out = []
+            for d in data:
+                inst_id = d.get("instId", "")
+                if inst_id not in self._tracked_assets:
+                    continue
+                for detail in d.get("details", []):
+                    try:
+                        out.append({
+                            "type":         "liquidation",
+                            "asset":        inst_id.upper(),
+                            "timestamp_ms": int(detail["ts"]),
+                            "side":         detail["side"].lower(),
+                            "price":        float(detail["bkPx"]),
+                            "quantity":     float(detail["sz"]),
+                        })
+                    except (ValueError, TypeError, KeyError):
+                        continue
             return out
 
         return super().parse_message(raw)
@@ -1045,21 +1131,24 @@ class BybitLinearExchange(BybitExchange):
     """
     Bybit v5 public WebSocket feed for USDT-margined linear perpetuals --
     same orderbook/trade message shapes as Bybit spot, just a different
-    host (wss://stream.bybit.com/v5/public/linear vs /spot) -- plus an
-    added `tickers.<symbol>` topic for a "funding" record type (matching
-    binance_futures).
+    host (wss://stream.bybit.com/v5/public/linear vs /spot) -- plus a
+    `tickers.<symbol>` topic for "funding" and "open_interest" record
+    types, and an `allLiquidation.<symbol>` topic for "liquidation"
+    records (matching binance_futures' stress-research coverage).
 
-    Confirmed via docs (and a real sample payload): Bybit's linear tickers
-    message bundles markPrice, fundingRate, and nextFundingTime into one
-    push -- unlike OKX, which splits these across two channels -- so
-    mark_price IS populated here, unlike the OKX swap adapter.
+    Confirmed via docs (and real sample payloads): Bybit's linear tickers
+    message bundles markPrice, fundingRate, nextFundingTime, openInterest,
+    and openInterestValue all into one push -- unlike OKX, which splits
+    funding rate and open interest across two separate channels -- so
+    both funding (with mark_price) and open_interest come from this one
+    subscription, no extra channel needed.
 
     The first tickers message per symbol is a full snapshot; subsequent
     "delta" messages may omit fields that haven't changed since the last
-    push. A funding record is only emitted when markPrice, fundingRate,
-    and nextFundingTime are all present on that particular message, so
-    expect fewer funding records than a channel that always re-sends
-    everything -- at least one per snapshot, typically more.
+    push. A funding/open_interest record is only emitted when that
+    record's own required fields are all present on a given message, so
+    expect fewer records than a channel that always re-sends everything --
+    at least one of each per snapshot, typically more.
     """
 
     name = "bybit_linear"
@@ -1074,6 +1163,10 @@ class BybitLinearExchange(BybitExchange):
             args.append(f"orderbook.50.{sym}")
             args.append(f"publicTrade.{sym}")
             args.append(f"tickers.{sym}")
+            # Confirmed real channel (replacing the deprecated
+            # liquidation.{symbol}, which only pushed 1/sec and missed
+            # most actual liquidations per Bybit's own changelog).
+            args.append(f"allLiquidation.{sym}")
         return [{"op": "subscribe", "args": args}]
 
     def parse_message(self, raw: dict) -> List[dict]:
@@ -1081,20 +1174,59 @@ class BybitLinearExchange(BybitExchange):
 
         if topic.startswith("tickers."):
             data = raw.get("data", {})
-            required = {"markPrice", "fundingRate", "nextFundingTime"}
-            if not required.issubset(data):
-                return []
-            try:
-                return [{
-                    "type":            "funding",
-                    "asset":           data.get("symbol", "").upper(),
-                    "timestamp_ms":    int(raw.get("ts", time.time() * 1000)),
-                    "mark_price":      float(data["markPrice"]),
-                    "funding_rate":    float(data["fundingRate"]),
-                    "next_funding_ms": int(data["nextFundingTime"]),
-                }]
-            except (ValueError, TypeError, KeyError):
-                return []
+            asset = data.get("symbol", "").upper()
+            out = []
+
+            funding_fields = {"markPrice", "fundingRate", "nextFundingTime"}
+            if funding_fields.issubset(data):
+                try:
+                    out.append({
+                        "type":            "funding",
+                        "asset":           asset,
+                        "timestamp_ms":    int(raw.get("ts", time.time() * 1000)),
+                        "mark_price":      float(data["markPrice"]),
+                        "funding_rate":    float(data["fundingRate"]),
+                        "next_funding_ms": int(data["nextFundingTime"]),
+                    })
+                except (ValueError, TypeError, KeyError):
+                    pass
+
+            # Confirmed via Bybit's own tickers payload (and a real
+            # sample capture): openInterest/openInterestValue arrive
+            # bundled into this same ticker message -- no separate
+            # channel needed, unlike OKX where these are split out.
+            oi_fields = {"openInterest", "openInterestValue"}
+            if oi_fields.issubset(data):
+                try:
+                    out.append({
+                        "type":                "open_interest",
+                        "asset":               asset,
+                        "timestamp_ms":        int(raw.get("ts", time.time() * 1000)),
+                        "open_interest":       float(data["openInterest"]),
+                        "open_interest_value": float(data["openInterestValue"]),
+                    })
+                except (ValueError, TypeError, KeyError):
+                    pass
+
+            return out
+
+        if topic.startswith("allLiquidation."):
+            # {"topic": "allLiquidation.ROSEUSDT", "type": "snapshot",
+            #  "ts": ..., "data": [{"T":..., "s":..., "S":..., "v":..., "p":...}]}
+            out = []
+            for d in raw.get("data", []):
+                try:
+                    out.append({
+                        "type":         "liquidation",
+                        "asset":        d["s"].upper(),
+                        "timestamp_ms": int(d["T"]),
+                        "side":         d["S"].lower(),
+                        "price":        float(d["p"]),
+                        "quantity":     float(d["v"]),
+                    })
+                except (ValueError, TypeError, KeyError):
+                    continue
+            return out
 
         return super().parse_message(raw)
 
@@ -1156,7 +1288,13 @@ class BinanceFuturesExchange(BinanceExchange):
         return f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
 
     def aux_ws_url(self, assets: List[str]) -> str:
-        streams = [f"{a.lower()}@markPrice@1s" for a in assets]
+        streams = []
+        for a in assets:
+            streams.append(f"{a.lower()}@markPrice@1s")
+            # Confirmed via Binance's official routed-stream mapping:
+            # forceOrder is /market, same category as markPrice -- same
+            # connection, no third one needed.
+            streams.append(f"{a.lower()}@forceOrder")
         return f"wss://fstream.binance.com/market/stream?streams={'/'.join(streams)}"
 
     def parse_message(self, raw: dict) -> List[dict]:
@@ -1177,6 +1315,22 @@ class BinanceFuturesExchange(BinanceExchange):
                 "mark_price":      float(data["p"]),
                 "funding_rate":    float(data["r"]),
                 "next_funding_ms": int(data["T"]),
+            }]
+
+        if "@forceOrder" in stream_name:
+            # Liquidation Order Streams payload:
+            # {"e":"forceOrder","E":..., "o":{"s":...,"S":...,"p":...,"q":...,"T":...}}
+            order = data.get("o", {})
+            required = {"s", "S", "p", "q", "T"}
+            if not required.issubset(order):
+                return []
+            return [{
+                "type":         "liquidation",
+                "asset":        order["s"].upper(),
+                "timestamp_ms": int(order["T"]),
+                "side":         order["S"].lower(),
+                "price":        float(order["p"]),
+                "quantity":     float(order["q"]),
             }]
 
         if "@depth" in stream_name:
@@ -1220,6 +1374,27 @@ class BinanceFuturesExchange(BinanceExchange):
 
     def snapshot_url(self, asset: str) -> str:
         return f"https://fapi.binance.com/fapi/v1/depth?symbol={asset.upper()}&limit=1000"
+
+    def open_interest_url(self, asset: str) -> str:
+        # No WebSocket push for raw open interest exists on Binance
+        # Futures -- confirmed via Binance's own docs and independently
+        # by Tardis.dev (a professional data vendor) REST-polling this
+        # exact endpoint themselves roughly every 6 seconds rather than
+        # using a push stream, because there isn't one.
+        return f"https://fapi.binance.com/fapi/v1/openInterest?symbol={asset.upper()}"
+
+    def parse_open_interest(self, asset: str, raw: dict) -> List[dict]:
+        # {"symbol":"BTCUSDT","openInterest":"10659.509","time":1625184323456}
+        required = {"openInterest", "time"}
+        if not required.issubset(raw):
+            return []
+        return [{
+            "type":                "open_interest",
+            "asset":               asset.upper(),
+            "timestamp_ms":        int(raw["time"]),
+            "open_interest":       float(raw["openInterest"]),
+            "open_interest_value": None,  # Binance doesn't provide a USD value here
+        }]
 
 
 # ──────────────────────────────────────────────────────────────────────────

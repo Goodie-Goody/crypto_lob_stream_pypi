@@ -18,6 +18,8 @@ from .schemas import (
     DEPTH_SCHEMA,
     FUNDING_SCHEMA,
     GAP_SCHEMA,
+    LIQUIDATION_SCHEMA,
+    OPEN_INTEREST_SCHEMA,
     SNAPSHOT_SCHEMA,
     TRADE_SCHEMA,
 )
@@ -69,6 +71,12 @@ class LOBStreamer:
         Local fallback directory used when GCS uploads fail.
     flush_interval : int
         Seconds between buffer flushes. Default 300 (5 minutes).
+    open_interest_poll_interval : int
+        Seconds between open-interest polls, for exchanges with no
+        WebSocket push for it (currently only binance_futures -- OKX
+        swap and Bybit linear deliver open interest over their existing
+        WebSocket channels, no polling involved). Default 30. Has no
+        effect at all for exchanges that don't need REST polling for this.
     on_trade : callable, optional
         Optional callback invoked for every normalised trade record.
     on_depth : callable, optional
@@ -117,6 +125,7 @@ class LOBStreamer:
         bucket: Optional[str] = None,
         fallback_dir: str = "./lob_fallback",
         flush_interval: int = 300,
+        open_interest_poll_interval: int = 30,
         on_trade: Optional[Callable] = None,
         on_depth: Optional[Callable] = None,
         on_gap: Optional[Callable] = None,
@@ -168,6 +177,7 @@ class LOBStreamer:
         self.bucket = bucket
         self.fallback_dir = fallback_dir
         self.flush_interval = flush_interval
+        self.open_interest_poll_interval = open_interest_poll_interval
         self.on_trade = on_trade
         self.on_depth = on_depth
         self.on_gap = on_gap
@@ -184,6 +194,8 @@ class LOBStreamer:
         self._gap_buffer: dict = defaultdict(list)
         self._checksum_buffer: dict = defaultdict(list)
         self._funding_buffer: dict = defaultdict(list)
+        self._liquidation_buffer: dict = defaultdict(list)
+        self._open_interest_buffer: dict = defaultdict(list)
         self._last_flush: float = time.time()
 
         # Gap detection state, keyed the same way.
@@ -371,6 +383,27 @@ class LOBStreamer:
             }
             self._funding_buffer[key].append(clean)
 
+        elif rtype == "liquidation":
+            clean = {
+                "timestamp_ms": record["timestamp_ms"],
+                "exchange":     exchange_name,
+                "asset":        asset,
+                "side":         record["side"],
+                "price":        record["price"],
+                "quantity":     record["quantity"],
+            }
+            self._liquidation_buffer[key].append(clean)
+
+        elif rtype == "open_interest":
+            clean = {
+                "timestamp_ms":         record["timestamp_ms"],
+                "exchange":             exchange_name,
+                "asset":                asset,
+                "open_interest":        record["open_interest"],
+                "open_interest_value":  record["open_interest_value"],
+            }
+            self._open_interest_buffer[key].append(clean)
+
     # ── Checksum verification (Kraken-style live book mirror) ───────────────
 
     def _maybe_verify_checksum(self, exch: Exchange, raw: dict, msg_type: str):
@@ -427,6 +460,8 @@ class LOBStreamer:
             (self._gap_buffer,      GAP_SCHEMA,      "gaps"),
             (self._checksum_buffer, CHECKSUM_SCHEMA, "checksums"),
             (self._funding_buffer,  FUNDING_SCHEMA,  "funding"),
+            (self._liquidation_buffer,   LIQUIDATION_SCHEMA,   "liquidations"),
+            (self._open_interest_buffer, OPEN_INTEREST_SCHEMA, "open_interest"),
         ]
 
     def _flush(self, force: bool = False):
@@ -600,6 +635,41 @@ class LOBStreamer:
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
 
+    async def _poll_open_interest(self, exch: Exchange, asset: str):
+        """Fetch and ingest one open-interest reading via REST, for
+        exchanges with no WebSocket push for it (see Exchange.open_interest_url
+        docstring -- currently only binance_futures uses this path)."""
+        url = exch.open_interest_url(asset)
+        if not url:
+            return
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Open interest HTTP {resp.status} for {exch.name}/{asset}")
+                        return
+                    raw = await resp.json()
+        except Exception as e:
+            logger.error(f"Open interest fetch failed for {exch.name}/{asset}: {e}")
+            return
+
+        for record in exch.parse_open_interest(asset, raw):
+            self._ingest(exch.name, exch, record)
+
+    async def _poll_open_interest_loop(self, feed: _Feed):
+        """Repeatedly poll open interest for every asset in this feed that
+        the exchange doesn't push over WebSocket. No-ops entirely (never
+        sleeps in a tight loop) for exchanges where open_interest_url()
+        returns "" for all assets, since open interest for those arrives
+        via parse_message/parse_aux_message instead."""
+        exch = feed.exchange
+        polled_assets = [a for a in feed.assets if exch.open_interest_url(a)]
+        if not polled_assets:
+            return
+        while True:
+            await asyncio.gather(*[self._poll_open_interest(exch, a) for a in polled_assets])
+            await asyncio.sleep(self.open_interest_poll_interval)
+
     async def _heartbeat(self):
         while True:
             await asyncio.sleep(self.flush_interval)
@@ -613,6 +683,8 @@ class LOBStreamer:
         for f in self.feeds:
             if f.exchange.aux_ws_url(f.assets):
                 tasks.append(self._stream_aux_feed(f))
+            if any(f.exchange.open_interest_url(a) for a in f.assets):
+                tasks.append(self._poll_open_interest_loop(f))
 
         heartbeat_task = asyncio.create_task(self._heartbeat())
         try:
