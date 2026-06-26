@@ -27,6 +27,7 @@ Normalised record shapes (what the streamer expects back):
      "price": float, "quantity": float, "last_update_id": int}
 """
 
+import hashlib
 import time
 import zlib
 from abc import ABC, abstractmethod
@@ -1079,11 +1080,14 @@ class BybitExchange(Exchange):
 
     @staticmethod
     def _trade_id(raw_id) -> int:
-        # Bybit trade IDs may be UUID strings; hash to a stable int if so.
+        # Bybit trade IDs may be UUID strings; map them to a stable int.
         try:
             return int(raw_id)
         except (ValueError, TypeError):
-            return abs(hash(str(raw_id))) % (10 ** 18)
+            digest = hashlib.blake2b(
+                str(raw_id).encode("utf-8"), digest_size=8
+            ).digest()
+            return int.from_bytes(digest, "big") % (10 ** 18)
 
     def snapshot_url(self, asset: str) -> str:
         return ""

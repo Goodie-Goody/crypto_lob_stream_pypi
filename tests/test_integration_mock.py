@@ -195,9 +195,15 @@ async def _run_binance_futures_aux_connection(tmp_path):
     )
     feed = s.feeds[0]
 
-    # Snapshot fetch will fail (no real network) -- that's fine, this test
-    # is only about the main/aux WebSocket split, not the REST snapshot.
-    with patch("crypto_lob_stream.streamer.websockets.connect", side_effect=fake_connect):
+    async def fake_fetch_snapshot(*args, **kwargs):
+        return None
+
+    # This test is only about the main/aux WebSocket split, not the REST
+    # snapshot path, so avoid depending on a real network request failing fast.
+    with (
+        patch("crypto_lob_stream.streamer.websockets.connect", side_effect=fake_connect),
+        patch.object(s, "_fetch_snapshot", new=fake_fetch_snapshot),
+    ):
         tasks = [
             asyncio.create_task(s._stream_feed(feed)),
             asyncio.create_task(s._stream_aux_feed(feed)),
