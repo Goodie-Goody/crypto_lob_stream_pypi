@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 from crypto_lob_stream import LOBStreamer
@@ -240,6 +241,36 @@ def test_on_gap_callback():
     assert received[0]["gap_size"] == 9
 
 
+def test_stale_depth_after_snapshot_is_ignored_without_false_gap():
+    s = LOBStreamer(assets=["BTCUSDT"], output="local", resync_on_gap=False)
+    exch = s.exchange
+    key = "binance:BTCUSDT"
+    s._last_update_id[key] = 1000
+
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "bid", "price": 1.0, "quantity": 1.0,
+        "first_update_id": 900, "last_update_id": 950,
+    })
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 1,
+        "side": "ask", "price": 2.0, "quantity": 1.0,
+        "first_update_id": 900, "last_update_id": 950,
+    })
+    assert s._depth_buffer[key] == []
+    assert s._gap_buffer[key] == []
+
+    s._ingest("binance", exch, {
+        "type": "depth", "asset": "BTCUSDT", "timestamp_ms": 2,
+        "side": "bid", "price": 1.0, "quantity": 2.0,
+        "first_update_id": 1001, "last_update_id": 1010,
+    })
+    assert len(s._depth_buffer[key]) == 1
+    assert s._depth_buffer[key][0]["quantity"] == 2.0
+    assert s._gap_buffer[key] == []
+    assert s._last_update_id[key] == 1010
+
+
 # ── Kraken checksum verification (LOBStreamer-level wiring) ─────────────────
 
 def test_maybe_verify_checksum_logs_mismatch():
@@ -448,6 +479,53 @@ def test_liquidation_and_open_interest_flush_to_parquet(tmp_path):
     assert len(oi_files) == 1
     assert pq.read_table(str(liq_files[0])).num_rows == 1
     assert pq.read_table(str(oi_files[0])).num_rows == 1
+
+
+def test_repeated_flushes_in_same_hour_do_not_overwrite(tmp_path, monkeypatch):
+    import crypto_lob_stream.streamer as streamer_module
+    import pyarrow.parquet as pq
+
+    flush_times = [
+        datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 6, 1, 12, 5, 0, tzinfo=timezone.utc),
+        datetime(2026, 6, 1, 12, 5, 0, tzinfo=timezone.utc),
+    ]
+
+    class FakeDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return flush_times.pop(0)
+
+    monkeypatch.setattr(streamer_module, "datetime", FakeDatetime)
+
+    s = LOBStreamer(
+        exchange="binance",
+        assets=["BTCUSDT"],
+        output="local",
+        output_dir=str(tmp_path),
+        flush_interval=9999,
+    )
+    for trade_id in (1, 2):
+        s._ingest("binance", s.exchange, {
+            "type": "trade", "asset": "BTCUSDT", "timestamp_ms": trade_id,
+            "trade_id": trade_id, "price": 1.0, "quantity": 1.0,
+            "buyer_maker": False,
+        })
+        s._flush(force=True)
+
+    trade_dir = tmp_path / "trades" / "binance" / "BTCUSDT"
+    files = sorted(trade_dir.glob("*.parquet"))
+    assert [f.name for f in files] == [
+        "2026-06-01-120000.parquet",
+        "2026-06-01-120500.parquet",
+    ]
+    trade_ids = [
+        row["trade_id"]
+        for f in files
+        for row in pq.read_table(str(f)).to_pylist()
+    ]
+    assert trade_ids == [1, 2]
 
 
 def test_poll_open_interest_loop_noops_for_exchanges_without_rest_polling():

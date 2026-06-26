@@ -294,15 +294,21 @@ class LOBStreamer:
 
     # ── Gap detection ────────────────────────────────────────────────────────
 
-    def _check_gap(self, exch: Exchange, asset: str, first_update_id: int, last_update_id: int):
+    def _check_gap(
+        self, exch: Exchange, asset: str, first_update_id: int, last_update_id: int
+    ) -> bool:
         key = self._key(exch.name, asset)
         batch = (first_update_id, last_update_id)
         if self._last_batch_seen.get(key) == batch:
             # Same message's other side of the book -- already checked.
-            return
-        self._last_batch_seen[key] = batch
+            return True
 
         last_seen = self._last_update_id.get(key)
+        if last_seen is not None and last_update_id <= last_seen:
+            return False
+
+        self._last_batch_seen[key] = batch
+
         if last_seen is not None and first_update_id > last_seen + 1:
             gap_size = first_update_id - last_seen - 1
             ts = int(time.time() * 1000)
@@ -333,6 +339,7 @@ class LOBStreamer:
                 )
 
         self._last_update_id[key] = last_update_id
+        return True
 
     # ── Normalised record dispatch ──────────────────────────────────────────────
 
@@ -367,7 +374,10 @@ class LOBStreamer:
                 "last_update_id":  record["last_update_id"],
             }
             if self.detect_gaps and exch.has_sequence_ids:
-                self._check_gap(exch, asset, record["first_update_id"], record["last_update_id"])
+                if not self._check_gap(
+                    exch, asset, record["first_update_id"], record["last_update_id"]
+                ):
+                    return
             if self.on_depth:
                 self.on_depth(clean)
             self._depth_buffer[key].append(clean)
@@ -469,7 +479,7 @@ class LOBStreamer:
         if not force and (now - self._last_flush) < self.flush_interval:
             return
 
-        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
+        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
         flush_time = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
         counts: dict = defaultdict(lambda: defaultdict(int))
