@@ -530,7 +530,7 @@ def test_bybit_parse_snapshot():
 def test_bybit_trade_id_int_passthrough():
     b = BybitExchange()
     assert b._trade_id("12345") == 12345
-    assert isinstance(b._trade_id("uuid-string-here"), int)
+    assert b._trade_id("uuid-string-here") == 833232925998947875
 
 # ── Binance Futures (perpetuals) ─────────────────────────────────────────────
 

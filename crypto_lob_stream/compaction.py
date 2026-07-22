@@ -147,7 +147,7 @@ def compact_tree(
             continue
         rel = leaf.relative_to(source_root_path)
         dest_leaf = Path(dest_root) / rel
-        results[str(rel)] = compact(
+        results[rel.as_posix()] = compact(
             str(leaf), str(dest_leaf), granularity=granularity, delete_source=delete_source
         )
 

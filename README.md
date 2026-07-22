@@ -170,15 +170,17 @@ streamer.run()
 
 ```
 {output_dir}/
-  trades/{exchange}/{asset}/YYYY-MM-DD-HH.parquet
-  depth/{exchange}/{asset}/YYYY-MM-DD-HH.parquet
+  trades/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
+  depth/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
   snapshots/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
-  gaps/{exchange}/{asset}/YYYY-MM-DD-HH.parquet            # only written when a gap is detected
-  checksums/{exchange}/{asset}/YYYY-MM-DD-HH.parquet       # only written on a mismatch
-  funding/{exchange}/{asset}/YYYY-MM-DD-HH.parquet         # futures/perps only
-  liquidations/{exchange}/{asset}/YYYY-MM-DD-HH.parquet    # futures/perps only
-  open_interest/{exchange}/{asset}/YYYY-MM-DD-HH.parquet   # futures/perps only
+  gaps/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
+  checksums/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
+  funding/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
+  liquidations/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
+  open_interest/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
 ```
+
+The `gaps/` and `checksums/` tables are only written when an integrity issue is detected. `funding/`, `liquidations/`, and `open_interest/` are futures/perpetuals only.
 
 All files are Snappy-compressed Parquet, flushed every 5 minutes by default (configurable with `--flush-interval`). Output is always partitioned by exchange first, then asset, so running multiple exchanges never collides, even for the same symbol on two different exchanges.
 
