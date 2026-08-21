@@ -15,16 +15,26 @@ Normalised record shapes (what the streamer expects back):
 
   trade:
     {"type": "trade", "asset": <UPPER>, "timestamp_ms": int,
-     "trade_id": int, "price": float, "quantity": float, "buyer_maker": bool}
+     "exchange_ts": int|None, "trade_id": int, "price": float,
+     "quantity": float, "buyer_maker": bool}
 
   depth (one record per price level):
     {"type": "depth", "asset": <UPPER>, "timestamp_ms": int,
-     "side": "bid"|"ask", "price": float, "quantity": float,
-     "first_update_id": int, "last_update_id": int}
+     "exchange_ts": int|None, "side": "bid"|"ask", "price": float,
+     "quantity": float, "first_update_id": int, "last_update_id": int}
 
   snapshot level (one record per price level):
     {"timestamp_ms": int, "asset": <UPPER>, "side": "bid"|"ask",
      "price": float, "quantity": float, "last_update_id": int}
+
+  funding / liquidation / open_interest records also carry
+  "exchange_ts": int|None alongside "timestamp_ms".
+
+timestamp_ms vs exchange_ts: timestamp_ms is ALWAYS this process's local
+receive time (never populated from an exchange field). exchange_ts is the
+exchange's own event time where the exchange provides one -- honestly
+None when it doesn't, never silently backfilled with local time. See the
+comment at the top of schemas.py for the full rationale.
 """
 
 import time
@@ -170,7 +180,7 @@ class BinanceExchange(Exchange):
         if not stream_name:
             return []
         asset = stream_name.split("@")[0].upper()
-        ts = int(time.time() * 1000)
+        ts = int(time.time() * 1000)  # local receive time -- always timestamp_ms, never exchange_ts
 
         if "@trade" in stream_name:
             required = {"T", "t", "p", "q", "m"}
@@ -179,7 +189,8 @@ class BinanceExchange(Exchange):
             return [{
                 "type":         "trade",
                 "asset":        asset,
-                "timestamp_ms": int(data["T"]),
+                "timestamp_ms": ts,
+                "exchange_ts":  int(data["T"]),
                 "trade_id":     int(data["t"]),
                 "price":        float(data["p"]),
                 "quantity":     float(data["q"]),
@@ -192,12 +203,17 @@ class BinanceExchange(Exchange):
                 return []
             first_uid = int(data["U"])
             last_uid = int(data["u"])
+            # "E" (event time) is on Binance's depth payload per their docs
+            # but isn't in `required` above -- some historical/replayed
+            # payloads may omit it, so this stays defensive.
+            exch_ts = int(data["E"]) if "E" in data else None
             out = []
             for price, qty in data["b"]:
                 out.append({
                     "type":            "depth",
                     "asset":           asset,
                     "timestamp_ms":    ts,
+                    "exchange_ts":     exch_ts,
                     "side":            "bid",
                     "price":           float(price),
                     "quantity":        float(qty),
@@ -209,6 +225,7 @@ class BinanceExchange(Exchange):
                     "type":            "depth",
                     "asset":           asset,
                     "timestamp_ms":    ts,
+                    "exchange_ts":     exch_ts,
                     "side":            "ask",
                     "price":           float(price),
                     "quantity":        float(qty),
@@ -302,18 +319,33 @@ class CoinbaseExchange(Exchange):
                 return f"{s[:-len(quote)]}-{quote}"
         return s
 
-    def _ms(self, iso_time: str) -> int:
-        # Coinbase timestamps look like "2026-06-12T11:05:57.123456Z"
-        from datetime import datetime, timezone
+    def _parse_iso_ms(self, iso_time: str) -> Optional[int]:
+        """Parse Coinbase's ISO8601 timestamp (e.g.
+        "2026-06-12T11:05:57.123456Z") into ms since epoch. Returns None
+        on failure -- this is the honest exchange_ts value, never silently
+        backfilled with local time."""
+        from datetime import datetime
         try:
             iso = iso_time.replace("Z", "+00:00")
             dt = datetime.fromisoformat(iso)
             return int(dt.timestamp() * 1000)
         except Exception:
-            return int(time.time() * 1000)
+            return None
+
+    def _ordering_ts(self, iso_time: str, local_ts: int) -> int:
+        """Best-effort ordering key for first_update_id/last_update_id --
+        always returns a value (falling back to local receive time) since
+        Coinbase has no real sequence id and something is needed here for
+        the ordering plumbing to work, even though has_sequence_ids=False
+        means the gap detector itself never runs for this exchange. This
+        is intentionally separate from exchange_ts, which stays None on
+        parse failure rather than being backfilled."""
+        parsed = self._parse_iso_ms(iso_time)
+        return parsed if parsed is not None else local_ts
 
     def parse_message(self, raw: dict) -> List[dict]:
         msg_type = raw.get("type", "")
+        local_ts = int(time.time() * 1000)  # local receive time -- always timestamp_ms
 
         # Trades
         if msg_type == "match" or msg_type == "last_match":
@@ -326,7 +358,8 @@ class CoinbaseExchange(Exchange):
             return [{
                 "type":         "trade",
                 "asset":        asset,
-                "timestamp_ms": self._ms(raw.get("time", "")),
+                "timestamp_ms": local_ts,
+                "exchange_ts":  self._parse_iso_ms(raw.get("time", "")),
                 "trade_id":     int(raw.get("trade_id", 0)),
                 "price":        float(raw["price"]),
                 "quantity":     float(raw["size"]),
@@ -336,7 +369,8 @@ class CoinbaseExchange(Exchange):
         # Incremental depth updates
         if msg_type == "l2update":
             asset = raw.get("product_id", "").upper()
-            ts = self._ms(raw.get("time", ""))
+            exch_ts = self._parse_iso_ms(raw.get("time", ""))
+            order_ts = self._ordering_ts(raw.get("time", ""), local_ts)
             out = []
             for change in raw.get("changes", []):
                 # change = [side, price, size]; side is "buy"/"sell"
@@ -347,12 +381,13 @@ class CoinbaseExchange(Exchange):
                 out.append({
                     "type":            "depth",
                     "asset":           asset,
-                    "timestamp_ms":    ts,
+                    "timestamp_ms":    local_ts,
+                    "exchange_ts":     exch_ts,
                     "side":            side,
                     "price":           float(price),
                     "quantity":        float(size),
-                    "first_update_id": ts,
-                    "last_update_id":  ts,
+                    "first_update_id": order_ts,
+                    "last_update_id":  order_ts,
                 })
             return out
 
@@ -444,6 +479,7 @@ class OKXExchange(Exchange):
             return []
 
         inst = arg.get("instId", "").upper()
+        local_ts = int(time.time() * 1000)  # local receive time -- always timestamp_ms
 
         # Trades
         if channel == "trades":
@@ -457,7 +493,8 @@ class OKXExchange(Exchange):
                     out.append({
                         "type":         "trade",
                         "asset":        inst,
-                        "timestamp_ms": int(t["ts"]),
+                        "timestamp_ms": local_ts,
+                        "exchange_ts":  int(t["ts"]),
                         "trade_id":     int(t["tradeId"]),
                         "price":        float(t["px"]),
                         "quantity":     float(t["sz"]),
@@ -474,14 +511,15 @@ class OKXExchange(Exchange):
                 return []  # handled by the snapshot path
             out = []
             for book in data:
-                ts = int(book.get("ts", 0))
-                seq = int(book.get("seqId", ts))
+                exch_ts = int(book["ts"]) if "ts" in book else None
+                seq = int(book.get("seqId", exch_ts if exch_ts is not None else local_ts))
                 prev = int(book.get("prevSeqId", seq))
                 for price, qty, *_ in book.get("bids", []):
                     out.append({
                         "type":            "depth",
                         "asset":           inst,
-                        "timestamp_ms":    ts,
+                        "timestamp_ms":    local_ts,
+                        "exchange_ts":     exch_ts,
                         "side":            "bid",
                         "price":           float(price),
                         "quantity":        float(qty),
@@ -492,7 +530,8 @@ class OKXExchange(Exchange):
                     out.append({
                         "type":            "depth",
                         "asset":           inst,
-                        "timestamp_ms":    ts,
+                        "timestamp_ms":    local_ts,
+                        "exchange_ts":     exch_ts,
                         "side":            "ask",
                         "price":           float(price),
                         "quantity":        float(qty),
@@ -521,8 +560,9 @@ class OKXExchange(Exchange):
         if not data:
             return []
         book = data[0]
-        ts = int(book.get("ts", 0)) or int(time.time() * 1000)
-        seq = int(book.get("seqId", ts))
+        ts = int(time.time() * 1000)  # local receive time, consistent with timestamp_ms elsewhere
+        exch_ts = int(book["ts"]) if book.get("ts") else None
+        seq = int(book.get("seqId", exch_ts if exch_ts is not None else ts))
         records = []
         for price, qty, *_ in book.get("bids", []):
             records.append({
@@ -620,13 +660,15 @@ class OKXSwapExchange(OKXExchange):
 
         if channel == "funding-rate":
             data = raw.get("data", [])
+            local_ts = int(time.time() * 1000)
             out = []
             for d in data:
                 try:
                     out.append({
                         "type":            "funding",
                         "asset":           d.get("instId", arg.get("instId", "")).upper(),
-                        "timestamp_ms":    int(d.get("ts", time.time() * 1000)),
+                        "timestamp_ms":    local_ts,
+                        "exchange_ts":     int(d["ts"]) if "ts" in d else None,
                         "mark_price":      None,
                         "funding_rate":    float(d["fundingRate"]),
                         "next_funding_ms": int(d["nextFundingTime"]),
@@ -644,13 +686,15 @@ class OKXSwapExchange(OKXExchange):
             # open_interest_value below will just come through as None
             # rather than raising.
             data = raw.get("data", [])
+            local_ts = int(time.time() * 1000)
             out = []
             for d in data:
                 try:
                     out.append({
                         "type":                "open_interest",
                         "asset":               d.get("instId", "").upper(),
-                        "timestamp_ms":        int(d.get("ts", time.time() * 1000)),
+                        "timestamp_ms":        local_ts,
+                        "exchange_ts":         int(d["ts"]) if "ts" in d else None,
                         "open_interest":       float(d["oi"]),
                         "open_interest_value": float(d["oiUsd"]) if "oiUsd" in d else None,
                     })
@@ -662,6 +706,7 @@ class OKXSwapExchange(OKXExchange):
             # Pushed per instType (e.g. all of SWAP), not per instId --
             # filter down to just what this feed tracks.
             data = raw.get("data", [])
+            local_ts = int(time.time() * 1000)
             out = []
             for d in data:
                 inst_id = d.get("instId", "")
@@ -672,7 +717,8 @@ class OKXSwapExchange(OKXExchange):
                         out.append({
                             "type":         "liquidation",
                             "asset":        inst_id.upper(),
-                            "timestamp_ms": int(detail["ts"]),
+                            "timestamp_ms": local_ts,
+                            "exchange_ts":  int(detail["ts"]),
                             "side":         detail["side"].lower(),
                             "price":        float(detail["bkPx"]),
                             "quantity":     float(detail["sz"]),
@@ -754,14 +800,28 @@ class KrakenExchange(Exchange):
                 return f"{s[:-len(quote)]}/{quote}"
         return s
 
-    def _ms(self, iso_time: str) -> int:
+    def _parse_iso_ms(self, iso_time: str) -> Optional[int]:
+        """Parse Kraken's ISO8601 message timestamp into ms since epoch.
+        Returns None on failure -- this is the honest exchange_ts value,
+        never silently backfilled with local time."""
         from datetime import datetime
         try:
             return int(datetime.fromisoformat(
                 iso_time.replace("Z", "+00:00")
             ).timestamp() * 1000)
         except Exception:
-            return int(time.time() * 1000)
+            return None
+
+    def _ordering_ts(self, iso_time: str, local_ts: int) -> int:
+        """Best-effort ordering key for first_update_id/last_update_id --
+        always returns a value (falling back to local receive time) since
+        Kraken has no real sequence id and something is needed here for
+        the ordering plumbing to work, even though has_sequence_ids=False
+        means the gap detector itself never runs for this exchange. This
+        is intentionally separate from exchange_ts, which stays None on
+        parse failure rather than being backfilled."""
+        parsed = self._parse_iso_ms(iso_time)
+        return parsed if parsed is not None else local_ts
 
     def parse_message(self, raw: dict) -> List[dict]:
         channel = raw.get("channel", "")
@@ -769,6 +829,7 @@ class KrakenExchange(Exchange):
         data = raw.get("data", [])
         if not channel or not data:
             return []
+        local_ts = int(time.time() * 1000)  # local receive time -- always timestamp_ms
 
         # Trades
         if channel == "trade":
@@ -780,7 +841,8 @@ class KrakenExchange(Exchange):
                     out.append({
                         "type":         "trade",
                         "asset":        t.get("symbol", "").upper(),
-                        "timestamp_ms": self._ms(t.get("timestamp", "")),
+                        "timestamp_ms": local_ts,
+                        "exchange_ts":  self._parse_iso_ms(t.get("timestamp", "")),
                         "trade_id":     int(t.get("trade_id", 0)),
                         "price":        float(t["price"]),
                         "quantity":     float(t["qty"]),
@@ -797,28 +859,31 @@ class KrakenExchange(Exchange):
             out = []
             for book in data:
                 asset = book.get("symbol", "").upper()
-                ts = self._ms(book.get("timestamp", ""))
+                exch_ts = self._parse_iso_ms(book.get("timestamp", ""))
+                order_ts = self._ordering_ts(book.get("timestamp", ""), local_ts)
                 for lvl in book.get("bids", []):
                     out.append({
                         "type":            "depth",
                         "asset":           asset,
-                        "timestamp_ms":    ts,
+                        "timestamp_ms":    local_ts,
+                        "exchange_ts":     exch_ts,
                         "side":            "bid",
                         "price":           float(lvl["price"]),
                         "quantity":        float(lvl["qty"]),
-                        "first_update_id": ts,
-                        "last_update_id":  ts,
+                        "first_update_id": order_ts,
+                        "last_update_id":  order_ts,
                     })
                 for lvl in book.get("asks", []):
                     out.append({
                         "type":            "depth",
                         "asset":           asset,
-                        "timestamp_ms":    ts,
+                        "timestamp_ms":    local_ts,
+                        "exchange_ts":     exch_ts,
                         "side":            "ask",
                         "price":           float(lvl["price"]),
                         "quantity":        float(lvl["qty"]),
-                        "first_update_id": ts,
-                        "last_update_id":  ts,
+                        "first_update_id": order_ts,
+                        "last_update_id":  order_ts,
                     })
             return out
 
@@ -841,7 +906,13 @@ class KrakenExchange(Exchange):
         if not data:
             return []
         book = data[0]
-        ts = self._ms(book.get("timestamp", "")) or int(time.time() * 1000)
+        ts = int(time.time() * 1000)  # local receive time, consistent with timestamp_ms elsewhere
+        # Ordering key stays exchange-time-preferred (falling back to local
+        # ts on parse failure), matching parse_message's depth updates --
+        # both derive from the same _ordering_ts fallback rule, so the
+        # snapshot's baseline chains sensibly with the first update even
+        # though has_sequence_ids=False means nothing actually enforces it.
+        order_ts = self._ordering_ts(book.get("timestamp", ""), ts)
         records = []
         for lvl in book.get("bids", []):
             records.append({
@@ -850,7 +921,7 @@ class KrakenExchange(Exchange):
                 "side":           "bid",
                 "price":          float(lvl["price"]),
                 "quantity":       float(lvl["qty"]),
-                "last_update_id": ts,
+                "last_update_id": order_ts,
             })
         for lvl in book.get("asks", []):
             records.append({
@@ -859,7 +930,7 @@ class KrakenExchange(Exchange):
                 "side":           "ask",
                 "price":          float(lvl["price"]),
                 "quantity":       float(lvl["qty"]),
-                "last_update_id": ts,
+                "last_update_id": order_ts,
             })
         return records
 
@@ -1007,6 +1078,8 @@ class BybitExchange(Exchange):
         if not topic:
             return []
 
+        local_ts = int(time.time() * 1000)  # local receive time -- always timestamp_ms
+
         # Trades: publicTrade.<SYMBOL>
         if topic.startswith("publicTrade."):
             data = raw.get("data", [])
@@ -1018,7 +1091,8 @@ class BybitExchange(Exchange):
                     out.append({
                         "type":         "trade",
                         "asset":        t.get("s", "").upper(),
-                        "timestamp_ms": int(t["T"]),
+                        "timestamp_ms": local_ts,
+                        "exchange_ts":  int(t["T"]),
                         "trade_id":     self._trade_id(t.get("i", 0)),
                         "price":        float(t["p"]),
                         "quantity":     float(t["v"]),
@@ -1034,7 +1108,7 @@ class BybitExchange(Exchange):
                 return []  # handled by snapshot path
             data = raw.get("data", {})
             asset = data.get("s", "").upper()
-            ts = int(raw.get("ts", 0))
+            exch_ts = int(raw["ts"]) if "ts" in raw else None
             # "u" is the real per-symbol update counter and the correct
             # continuity id -- it's what parse_snapshot() seeds
             # last_update_id from too. "seq" is a *different* counter
@@ -1049,13 +1123,14 @@ class BybitExchange(Exchange):
             # thousands of gap events in under a minute, each with mismatched
             # orders of magnitude between expected/received -- a real gap
             # looks like a small jump, not 12 orders of magnitude.
-            uid = int(data.get("u", ts))
+            uid = int(data.get("u", exch_ts if exch_ts is not None else local_ts))
             out = []
             for price, qty in data.get("b", []):
                 out.append({
                     "type":            "depth",
                     "asset":           asset,
-                    "timestamp_ms":    ts,
+                    "timestamp_ms":    local_ts,
+                    "exchange_ts":     exch_ts,
                     "side":            "bid",
                     "price":           float(price),
                     "quantity":        float(qty),
@@ -1066,7 +1141,8 @@ class BybitExchange(Exchange):
                 out.append({
                     "type":            "depth",
                     "asset":           asset,
-                    "timestamp_ms":    ts,
+                    "timestamp_ms":    local_ts,
+                    "exchange_ts":     exch_ts,
                     "side":            "ask",
                     "price":           float(price),
                     "quantity":        float(qty),
@@ -1099,8 +1175,9 @@ class BybitExchange(Exchange):
 
     def parse_snapshot(self, asset: str, raw: dict) -> List[dict]:
         data = raw.get("data", {})
-        ts = int(raw.get("ts", 0)) or int(time.time() * 1000)
-        uid = int(data.get("u", ts))
+        ts = int(time.time() * 1000)  # local receive time, consistent with timestamp_ms elsewhere
+        exch_ts = int(raw["ts"]) if raw.get("ts") else None
+        uid = int(data.get("u", exch_ts if exch_ts is not None else ts))
         records = []
         for price, qty in data.get("b", []):
             records.append({
@@ -1172,9 +1249,12 @@ class BybitLinearExchange(BybitExchange):
     def parse_message(self, raw: dict) -> List[dict]:
         topic = raw.get("topic", "")
 
+        local_ts = int(time.time() * 1000)  # local receive time -- always timestamp_ms
+
         if topic.startswith("tickers."):
             data = raw.get("data", {})
             asset = data.get("symbol", "").upper()
+            exch_ts = int(raw["ts"]) if "ts" in raw else None
             out = []
 
             funding_fields = {"markPrice", "fundingRate", "nextFundingTime"}
@@ -1183,7 +1263,8 @@ class BybitLinearExchange(BybitExchange):
                     out.append({
                         "type":            "funding",
                         "asset":           asset,
-                        "timestamp_ms":    int(raw.get("ts", time.time() * 1000)),
+                        "timestamp_ms":    local_ts,
+                        "exchange_ts":     exch_ts,
                         "mark_price":      float(data["markPrice"]),
                         "funding_rate":    float(data["fundingRate"]),
                         "next_funding_ms": int(data["nextFundingTime"]),
@@ -1201,7 +1282,8 @@ class BybitLinearExchange(BybitExchange):
                     out.append({
                         "type":                "open_interest",
                         "asset":               asset,
-                        "timestamp_ms":        int(raw.get("ts", time.time() * 1000)),
+                        "timestamp_ms":        local_ts,
+                        "exchange_ts":         exch_ts,
                         "open_interest":       float(data["openInterest"]),
                         "open_interest_value": float(data["openInterestValue"]),
                     })
@@ -1219,7 +1301,8 @@ class BybitLinearExchange(BybitExchange):
                     out.append({
                         "type":         "liquidation",
                         "asset":        d["s"].upper(),
-                        "timestamp_ms": int(d["T"]),
+                        "timestamp_ms": local_ts,
+                        "exchange_ts":  int(d["T"]),
                         "side":         d["S"].lower(),
                         "price":        float(d["p"]),
                         "quantity":     float(d["v"]),
@@ -1303,6 +1386,7 @@ class BinanceFuturesExchange(BinanceExchange):
         if not stream_name:
             return []
         asset = stream_name.split("@")[0].upper()
+        local_ts = int(time.time() * 1000)  # local receive time -- always timestamp_ms
 
         if "@markPrice" in stream_name:
             required = {"E", "p", "r", "T"}
@@ -1311,7 +1395,8 @@ class BinanceFuturesExchange(BinanceExchange):
             return [{
                 "type":            "funding",
                 "asset":           asset,
-                "timestamp_ms":    int(data["E"]),
+                "timestamp_ms":    local_ts,
+                "exchange_ts":     int(data["E"]),
                 "mark_price":      float(data["p"]),
                 "funding_rate":    float(data["r"]),
                 "next_funding_ms": int(data["T"]),
@@ -1327,7 +1412,8 @@ class BinanceFuturesExchange(BinanceExchange):
             return [{
                 "type":         "liquidation",
                 "asset":        order["s"].upper(),
-                "timestamp_ms": int(order["T"]),
+                "timestamp_ms": local_ts,
+                "exchange_ts":  int(order["T"]),
                 "side":         order["S"].lower(),
                 "price":        float(order["p"]),
                 "quantity":     float(order["q"]),
@@ -1337,18 +1423,22 @@ class BinanceFuturesExchange(BinanceExchange):
             required = {"U", "u", "b", "a"}
             if not required.issubset(data):
                 return []
-            ts = int(time.time() * 1000)
             # Futures continuity anchor is "pu" (previous final update id),
             # not "U" -- fall back to U if a futures-style message is ever
             # missing it, but pu is what Binance's docs say to chain on.
             first_uid = int(data.get("pu", data["U"]))
             last_uid = int(data["u"])
+            # "E" (event time) is on Binance's depth payload per their docs
+            # but isn't in `required` above -- some historical/replayed
+            # payloads may omit it, so this stays defensive.
+            exch_ts = int(data["E"]) if "E" in data else None
             out = []
             for price, qty in data["b"]:
                 out.append({
                     "type":            "depth",
                     "asset":           asset,
-                    "timestamp_ms":    ts,
+                    "timestamp_ms":    local_ts,
+                    "exchange_ts":     exch_ts,
                     "side":            "bid",
                     "price":           float(price),
                     "quantity":        float(qty),
@@ -1359,7 +1449,8 @@ class BinanceFuturesExchange(BinanceExchange):
                 out.append({
                     "type":            "depth",
                     "asset":           asset,
-                    "timestamp_ms":    ts,
+                    "timestamp_ms":    local_ts,
+                    "exchange_ts":     exch_ts,
                     "side":            "ask",
                     "price":           float(price),
                     "quantity":        float(qty),
@@ -1391,7 +1482,12 @@ class BinanceFuturesExchange(BinanceExchange):
         return [{
             "type":                "open_interest",
             "asset":               asset.upper(),
-            "timestamp_ms":        int(raw["time"]),
+            # This is REST-polled rather than pushed, but the same
+            # local-vs-exchange split applies: "time" is Binance's own
+            # timestamp for when it computed the figure, not when this
+            # process received the response.
+            "timestamp_ms":        int(time.time() * 1000),
+            "exchange_ts":         int(raw["time"]),
             "open_interest":       float(raw["openInterest"]),
             "open_interest_value": None,  # Binance doesn't provide a USD value here
         }]

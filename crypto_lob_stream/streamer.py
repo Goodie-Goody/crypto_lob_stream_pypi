@@ -344,6 +344,7 @@ class LOBStreamer:
         if rtype == "trade":
             clean = {
                 "timestamp_ms": record["timestamp_ms"],
+                "exchange_ts":  record.get("exchange_ts"),
                 "exchange":     exchange_name,
                 "asset":        asset,
                 "trade_id":     record["trade_id"],
@@ -358,6 +359,7 @@ class LOBStreamer:
         elif rtype == "depth":
             clean = {
                 "timestamp_ms":    record["timestamp_ms"],
+                "exchange_ts":     record.get("exchange_ts"),
                 "exchange":        exchange_name,
                 "asset":           asset,
                 "side":            record["side"],
@@ -375,6 +377,7 @@ class LOBStreamer:
         elif rtype == "funding":
             clean = {
                 "timestamp_ms":     record["timestamp_ms"],
+                "exchange_ts":      record.get("exchange_ts"),
                 "exchange":         exchange_name,
                 "asset":            asset,
                 "mark_price":       record["mark_price"],
@@ -386,6 +389,7 @@ class LOBStreamer:
         elif rtype == "liquidation":
             clean = {
                 "timestamp_ms": record["timestamp_ms"],
+                "exchange_ts":  record.get("exchange_ts"),
                 "exchange":     exchange_name,
                 "asset":        asset,
                 "side":         record["side"],
@@ -397,6 +401,7 @@ class LOBStreamer:
         elif rtype == "open_interest":
             clean = {
                 "timestamp_ms":         record["timestamp_ms"],
+                "exchange_ts":          record.get("exchange_ts"),
                 "exchange":             exchange_name,
                 "asset":                asset,
                 "open_interest":        record["open_interest"],
