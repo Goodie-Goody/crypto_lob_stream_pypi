@@ -124,6 +124,53 @@ def test_compact_invalid_granularity_raises(tmp_path):
         compact(str(src), str(tmp_path / "dest"), granularity="fortnight")
 
 
+# ── Schema evolution across a bucket (e.g. exchange_ts added in 0.9.0) ──────
+
+def test_compact_merges_files_with_added_column_filling_null(tmp_path):
+    src = tmp_path / "source"
+    # Older file: no exchange_ts column at all.
+    old_row = {"timestamp_ms": 1, "exchange": "binance", "asset": "BTCUSDT",
+               "price": 1.0, "quantity": 1.0}
+    _write(src, "2026-06-01-00", [old_row])
+    # Newer file: same shape plus exchange_ts.
+    new_row = {**old_row, "exchange_ts": 1625184323456}
+    _write(src, "2026-06-01-12", [new_row])
+
+    dest = tmp_path / "dest"
+    summary = compact(str(src), str(dest), granularity="day")
+
+    assert summary == {"2026-06-01": 2}
+    rows = pq.read_table(str(dest / "2026-06-01.parquet")).to_pylist()
+    by_ts = {r["timestamp_ms"]: r for r in rows}
+    # Both rows share timestamp_ms=1 in this fixture; distinguish by content
+    exchange_ts_values = sorted(
+        (r.get("exchange_ts") is None, r.get("exchange_ts")) for r in rows
+    )
+    assert exchange_ts_values == [(False, 1625184323456), (True, None)]
+
+
+def test_compact_still_raises_on_genuine_type_conflict(tmp_path):
+    src = tmp_path / "source"
+    src.mkdir(parents=True)
+    # Same column name, incompatible types -- this must NOT be silently
+    # coerced; promote_options="default" only tolerates missing columns,
+    # not type conflicts on a shared column.
+    int_schema = pa.schema([("price", pa.int64())])
+    str_schema = pa.schema([("price", pa.string())])
+    pq.write_table(
+        pa.Table.from_pylist([{"price": 1}], schema=int_schema),
+        str(src / "2026-06-01-00.parquet"),
+    )
+    pq.write_table(
+        pa.Table.from_pylist([{"price": "not-a-number"}], schema=str_schema),
+        str(src / "2026-06-01-12.parquet"),
+    )
+
+    dest = tmp_path / "dest"
+    with pytest.raises(pa.lib.ArrowTypeError):
+        compact(str(src), str(dest), granularity="day")
+
+
 # ── compact_tree: whole output_dir at once ──────────────────────────────────
 
 def test_compact_tree_walks_exchange_asset_leaves(tmp_path):
@@ -144,4 +191,3 @@ def test_compact_tree_walks_exchange_asset_leaves(tmp_path):
 def test_compact_tree_missing_root_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         compact_tree(str(tmp_path / "nope"), str(tmp_path / "dest"))
-        
