@@ -11,6 +11,13 @@ thousands of tiny files per exchange/asset) is much slower than querying
 the same year compacted into ~12 monthly files, both because each small
 file carries its own read overhead and because cloud storage in
 particular has real per-file latency on top of that.
+
+Schema evolution: files within one bucket may span a schema change (a
+column added in a newer package version, e.g. exchange_ts in 0.9.0).
+compact() merges these by filling the missing column with null in the
+older rows, rather than raising -- this is what most pipelines actually
+want when compacting a window that straddles an upgrade. A genuine type
+conflict on a column present in both schemas still raises, as it should.
 """
 
 import re
@@ -107,7 +114,15 @@ def compact(
     summary: Dict[str, int] = {}
     for key, bucket_files in sorted(buckets.items()):
         tables = [pq.read_table(str(f)) for f in bucket_files]
-        merged = pa.concat_tables(tables)
+        # promote_options="default" allows merging files whose schemas
+        # differ only by column presence -- e.g. older files captured
+        # before a field was added (exchange_ts in 0.9.0 is the first
+        # real case of this). Missing columns are filled with null rather
+        # than raising ArrowInvalid, which is what plain concat_tables()
+        # does by default. This is deliberately permissive about *added*
+        # columns; it does NOT paper over a genuine type conflict on a
+        # column both schemas share (that still raises, as it should).
+        merged = pa.concat_tables(tables, promote_options="default")
         out_path = dest / f"{key}.parquet"
         pq.write_table(merged, str(out_path), compression="snappy")
         summary[key] = merged.num_rows
