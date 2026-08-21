@@ -1,7 +1,27 @@
 import pyarrow as pa
 
+# timestamp_ms vs exchange_ts
+# ---------------------------
+# timestamp_ms is ALWAYS local receive time -- the moment this process saw
+# the message (int(time.time() * 1000)) or, for REST-polled records, the
+# moment the response was parsed. It is never populated from an
+# exchange-supplied field, and it is present on every schema below
+# (including gaps and checksums), so it's always safe to sort/join on.
+#
+# exchange_ts is the exchange's own event timestamp where one exists
+# (e.g. Binance trade "T", Coinbase/Kraken's ISO message time, OKX/Bybit
+# "ts"), kept as a *separate*, nullable field. It is None when the
+# exchange genuinely doesn't supply one for that message (never silently
+# backfilled with local time), and it's only added to schemas where an
+# exchange-side event time is meaningful: trades, depth, funding,
+# liquidations, and open interest. It is deliberately omitted from
+# snapshots (REST/socket snapshots mostly carry no per-level exchange
+# time -- Binance's REST snapshot has none at all) and from gaps/
+# checksums, which are purely internal detection events with no
+# exchange-side timestamp to speak of.
 TRADE_SCHEMA = pa.schema([
     ("timestamp_ms", pa.int64()),
+    ("exchange_ts",  pa.int64()),
     ("exchange",     pa.string()),
     ("asset",        pa.string()),
     ("trade_id",     pa.int64()),
@@ -12,6 +32,7 @@ TRADE_SCHEMA = pa.schema([
 
 DEPTH_SCHEMA = pa.schema([
     ("timestamp_ms",    pa.int64()),
+    ("exchange_ts",     pa.int64()),
     ("exchange",        pa.string()),
     ("asset",           pa.string()),
     ("side",            pa.string()),
@@ -61,6 +82,7 @@ CHECKSUM_SCHEMA = pa.schema([
 # Futures/perps only (currently BinanceFuturesExchange's markPrice stream).
 FUNDING_SCHEMA = pa.schema([
     ("timestamp_ms",     pa.int64()),
+    ("exchange_ts",      pa.int64()),
     ("exchange",         pa.string()),
     ("asset",            pa.string()),
     ("mark_price",       pa.float64()),
@@ -72,6 +94,7 @@ FUNDING_SCHEMA = pa.schema([
 # clearest direct signal of leveraged positions getting stretched.
 LIQUIDATION_SCHEMA = pa.schema([
     ("timestamp_ms", pa.int64()),
+    ("exchange_ts",  pa.int64()),
     ("exchange",     pa.string()),
     ("asset",        pa.string()),
     ("side",         pa.string()),    # side of the liquidated position
@@ -84,6 +107,7 @@ LIQUIDATION_SCHEMA = pa.schema([
 # fuel, liquidations are the fire.
 OPEN_INTEREST_SCHEMA = pa.schema([
     ("timestamp_ms",         pa.int64()),
+    ("exchange_ts",          pa.int64()),
     ("exchange",             pa.string()),
     ("asset",                pa.string()),
     ("open_interest",        pa.float64()),  # in contracts/base currency

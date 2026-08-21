@@ -1,7 +1,15 @@
+import time
+
 import pytest
 from crypto_lob_stream.exchanges import (
     BinanceExchange,
+    BinanceFuturesExchange,
+    BybitExchange,
+    BybitLinearExchange,
     CoinbaseExchange,
+    KrakenExchange,
+    OKXExchange,
+    OKXSwapExchange,
     get_exchange,
     available_exchanges,
 )
@@ -914,12 +922,17 @@ def test_binance_futures_open_interest_url():
 def test_binance_futures_parses_open_interest_rest_response():
     bf = BinanceFuturesExchange()
     raw = {"symbol": "BTCUSDT", "openInterest": "10659.509", "time": 1625184323456}
+    before = int(time.time() * 1000)
     out = bf.parse_open_interest("BTCUSDT", raw)
+    after = int(time.time() * 1000)
     assert len(out) == 1
     assert out[0]["type"] == "open_interest"
     assert out[0]["open_interest"] == 10659.509
     assert out[0]["open_interest_value"] is None  # Binance doesn't provide this
-    assert out[0]["timestamp_ms"] == 1625184323456
+    # timestamp_ms is local receive time, not Binance's "time" field
+    assert before <= out[0]["timestamp_ms"] <= after
+    # exchange_ts carries Binance's own "time" field honestly
+    assert out[0]["exchange_ts"] == 1625184323456
 
 
 def test_binance_futures_malformed_open_interest_ignored():
@@ -1068,3 +1081,220 @@ def test_bybit_linear_tickers_emits_only_open_interest_when_funding_fields_absen
     }
     out = byb.parse_message(raw)
     assert [r["type"] for r in out] == ["open_interest"]
+
+# ── timestamp_ms / exchange_ts split ────────────────────────────────────────
+#
+# timestamp_ms must always be local receive time (close to time.time() at
+# call time), never a value lifted from the exchange payload. exchange_ts
+# must carry the exchange's own event time honestly -- present when the
+# exchange provides one, None when it doesn't (never silently backfilled
+# with local time). See the comment at the top of schemas.py.
+
+def _assert_local_ts(ts_ms, before, after):
+    assert before <= ts_ms <= after, (
+        f"timestamp_ms={ts_ms} not within local receive window "
+        f"[{before}, {after}] -- looks like it leaked an exchange timestamp"
+    )
+
+
+def test_binance_trade_timestamp_ms_is_local_not_exchange_time():
+    b = BinanceExchange()
+    raw = {
+        "stream": "btcusdt@trade",
+        "data": {"T": 1625184323456, "t": 1, "p": "1", "q": "1", "m": True},
+    }
+    before = int(time.time() * 1000)
+    out = b.parse_message(raw)
+    after = int(time.time() * 1000)
+    assert len(out) == 1
+    _assert_local_ts(out[0]["timestamp_ms"], before, after)
+    assert out[0]["exchange_ts"] == 1625184323456
+
+
+def test_binance_depth_exchange_ts_present_when_E_provided():
+    b = BinanceExchange()
+    raw = {
+        "stream": "btcusdt@depth@100ms",
+        "data": {"E": 1625184323456, "U": 1, "u": 2, "b": [["1", "1"]], "a": []},
+    }
+    out = b.parse_message(raw)
+    assert out[0]["exchange_ts"] == 1625184323456
+
+
+def test_binance_depth_exchange_ts_none_when_E_absent():
+    b = BinanceExchange()
+    raw = {
+        "stream": "btcusdt@depth@100ms",
+        "data": {"U": 1, "u": 2, "b": [["1", "1"]], "a": []},
+    }
+    out = b.parse_message(raw)
+    assert out[0]["exchange_ts"] is None
+    # local_update_id/timestamp_ms plumbing is unaffected by exchange_ts
+    # being absent
+    assert out[0]["first_update_id"] == 1
+    assert out[0]["last_update_id"] == 2
+
+
+def test_binance_futures_funding_and_liquidation_exchange_ts():
+    bf = BinanceFuturesExchange()
+    before = int(time.time() * 1000)
+    funding = bf.parse_message({
+        "stream": "btcusdt@markPrice@1s",
+        "data": {"E": 1625184323456, "p": "1", "r": "0.0001", "T": 1625184400000},
+    })
+    liquidation = bf.parse_message({
+        "stream": "btcusdt@forceOrder",
+        "data": {"o": {"s": "BTCUSDT", "S": "SELL", "p": "1", "q": "1", "T": 1625184500000}},
+    })
+    after = int(time.time() * 1000)
+    _assert_local_ts(funding[0]["timestamp_ms"], before, after)
+    assert funding[0]["exchange_ts"] == 1625184323456
+    _assert_local_ts(liquidation[0]["timestamp_ms"], before, after)
+    assert liquidation[0]["exchange_ts"] == 1625184500000
+
+
+def test_coinbase_trade_exchange_ts_parses_valid_iso_time():
+    cb = CoinbaseExchange()
+    raw = {
+        "type": "match", "product_id": "BTC-USD",
+        "price": "1", "size": "1", "side": "buy", "trade_id": 1,
+        "time": "2026-06-12T11:05:57.123456Z",
+    }
+    out = cb.parse_message(raw)
+    assert out[0]["exchange_ts"] == 1781262357123
+
+
+def test_coinbase_trade_exchange_ts_none_on_malformed_time():
+    cb = CoinbaseExchange()
+    raw = {
+        "type": "match", "product_id": "BTC-USD",
+        "price": "1", "size": "1", "side": "buy", "trade_id": 1,
+        "time": "not-a-timestamp",
+    }
+    before = int(time.time() * 1000)
+    out = cb.parse_message(raw)
+    after = int(time.time() * 1000)
+    assert out[0]["exchange_ts"] is None
+    # timestamp_ms must still be a sane local value even though the
+    # exchange time failed to parse
+    _assert_local_ts(out[0]["timestamp_ms"], before, after)
+
+
+def test_coinbase_l2update_ordering_id_falls_back_to_local_on_bad_time():
+    cb = CoinbaseExchange()
+    raw = {
+        "type": "l2update", "product_id": "BTC-USD", "time": "garbage",
+        "changes": [["buy", "100.0", "1.0"]],
+    }
+    before = int(time.time() * 1000)
+    out = cb.parse_message(raw)
+    after = int(time.time() * 1000)
+    assert out[0]["exchange_ts"] is None
+    _assert_local_ts(out[0]["timestamp_ms"], before, after)
+    # first/last_update_id still get a usable ordering value (local
+    # fallback), distinct from the honestly-None exchange_ts
+    assert before <= out[0]["first_update_id"] <= after
+    assert out[0]["first_update_id"] == out[0]["last_update_id"]
+
+
+def test_okx_trade_and_depth_exchange_ts():
+    okx = OKXExchange()
+    trade_out = okx.parse_message({
+        "arg": {"channel": "trades", "instId": "BTC-USDT"},
+        "data": [{"ts": "1625184323456", "tradeId": "1", "px": "1", "sz": "1", "side": "buy"}],
+    })
+    depth_out = okx.parse_message({
+        "arg": {"channel": "books", "instId": "BTC-USDT"},
+        "action": "update",
+        "data": [{"ts": "1625184400000", "seqId": 2, "prevSeqId": 1,
+                   "bids": [["1", "1", "0", "1"]], "asks": []}],
+    })
+    assert trade_out[0]["exchange_ts"] == 1625184323456
+    assert depth_out[0]["exchange_ts"] == 1625184400000
+
+
+def test_okx_swap_funding_open_interest_liquidation_exchange_ts():
+    okx = OKXSwapExchange()
+    okx.subscribe_messages(["BTC-USDT"])
+    funding_out = okx.parse_message({
+        "arg": {"channel": "funding-rate", "instId": "BTC-USDT-SWAP"},
+        "data": [{"instId": "BTC-USDT-SWAP", "ts": "1625184323456",
+                   "fundingRate": "0.0001", "nextFundingTime": "1625184400000"}],
+    })
+    oi_out = okx.parse_message({
+        "arg": {"channel": "open-interest", "instId": "BTC-USDT-SWAP"},
+        "data": [{"instId": "BTC-USDT-SWAP", "ts": "1625184400000", "oi": "1", "oiUsd": "1"}],
+    })
+    liq_out = okx.parse_message({
+        "arg": {"channel": "liquidation-orders"},
+        "data": [{"instId": "BTC-USDT-SWAP",
+                   "details": [{"ts": "1625184500000", "side": "buy", "bkPx": "1", "sz": "1"}]}],
+    })
+    assert funding_out[0]["exchange_ts"] == 1625184323456
+    assert oi_out[0]["exchange_ts"] == 1625184400000
+    assert liq_out[0]["exchange_ts"] == 1625184500000
+
+
+def test_kraken_trade_and_book_exchange_ts():
+    kr = KrakenExchange()
+    trade_out = kr.parse_message({
+        "channel": "trade", "type": "update",
+        "data": [{"symbol": "BTC/USD", "side": "sell", "trade_id": 1,
+                   "price": 1, "qty": 1, "timestamp": "2026-06-12T11:05:57.123456Z"}],
+    })
+    book_out = kr.parse_message({
+        "channel": "book", "type": "update",
+        "data": [{"symbol": "BTC/USD", "timestamp": "2026-06-12T11:06:00.000000Z",
+                   "bids": [{"price": 1, "qty": 1}], "asks": []}],
+    })
+    assert trade_out[0]["exchange_ts"] == 1781262357123
+    assert book_out[0]["exchange_ts"] == 1781262360000
+
+
+def test_kraken_book_exchange_ts_none_and_ordering_falls_back_on_bad_time():
+    kr = KrakenExchange()
+    before = int(time.time() * 1000)
+    out = kr.parse_message({
+        "channel": "book", "type": "update",
+        "data": [{"symbol": "BTC/USD", "timestamp": "garbage",
+                   "bids": [{"price": 1, "qty": 1}], "asks": []}],
+    })
+    after = int(time.time() * 1000)
+    assert out[0]["exchange_ts"] is None
+    _assert_local_ts(out[0]["timestamp_ms"], before, after)
+    assert before <= out[0]["first_update_id"] <= after
+
+
+def test_bybit_trade_and_depth_exchange_ts():
+    byb = BybitExchange()
+    trade_out = byb.parse_message({
+        "topic": "publicTrade.BTCUSDT",
+        "data": [{"T": 1625184323456, "i": "1", "p": "1", "v": "1", "S": "Buy", "s": "BTCUSDT"}],
+    })
+    depth_out = byb.parse_message({
+        "topic": "orderbook.50.BTCUSDT", "type": "delta", "ts": 1625184400000,
+        "data": {"s": "BTCUSDT", "u": 5, "b": [["1", "1"]], "a": []},
+    })
+    assert trade_out[0]["exchange_ts"] == 1625184323456
+    assert depth_out[0]["exchange_ts"] == 1625184400000
+    # real per-symbol update id "u" is untouched by the timestamp fix
+    assert depth_out[0]["first_update_id"] == 5
+
+
+def test_bybit_linear_funding_open_interest_liquidation_exchange_ts():
+    byb = BybitLinearExchange()
+    out = byb.parse_message({
+        "topic": "tickers.BTCUSDT", "type": "snapshot", "ts": 1625184323456,
+        "data": {"symbol": "BTCUSDT", "markPrice": "1", "fundingRate": "0.0001",
+                  "nextFundingTime": "1625184400000",
+                  "openInterest": "1", "openInterestValue": "1"},
+    })
+    liq_out = byb.parse_message({
+        "topic": "allLiquidation.BTCUSDT", "type": "snapshot", "ts": 1,
+        "data": [{"T": 1625184500000, "s": "BTCUSDT", "S": "Sell", "v": "1", "p": "1"}],
+    })
+    funding = next(r for r in out if r["type"] == "funding")
+    oi = next(r for r in out if r["type"] == "open_interest")
+    assert funding["exchange_ts"] == 1625184323456
+    assert oi["exchange_ts"] == 1625184323456
+    assert liq_out[0]["exchange_ts"] == 1625184500000
