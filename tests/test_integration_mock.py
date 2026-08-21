@@ -82,6 +82,32 @@ class _FakeSession:
         return _FakeResp(self.payload)
 
 
+async def _wait_until(condition, timeout=2.0, interval=0.01):
+    """Poll `condition` (a zero-arg callable) until it returns truthy or
+    `timeout` seconds elapse, then return regardless.
+
+    Replaces the previous "sleep a fixed amount, then assert" pattern used
+    throughout this file, which was racy: a fixed sleep assumes the mocked
+    async loop always gets scheduled and finishes its work within that
+    window, which doesn't hold under CI runner jitter (a loaded/throttled
+    shared runner can be slow enough to miss a 0.5s window even though the
+    work itself takes milliseconds) -- caught via a real CI failure
+    (IndexError on an empty buffer) that never reproduced locally in 30/30
+    runs, exactly the signature of a scheduling race rather than a real
+    bug. Polling in small increments returns as soon as the condition is
+    met (fast in the normal case) while tolerating slow scheduling (robust
+    in the slow case), and the timeout is just a ceiling so a genuinely
+    broken pipeline still fails instead of hanging.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if condition():
+            return True
+        await asyncio.sleep(interval)
+    return condition()
+
+
 BINANCE_SNAPSHOT = {"lastUpdateId": 100, "bids": [["65000.0", "0.5"]], "asks": [["65001.0", "0.3"]]}
 
 BINANCE_MSGS = [
@@ -142,7 +168,11 @@ async def _run_multi_exchange_gap_and_checksum_pipeline(tmp_path):
          patch("crypto_lob_stream.streamer.aiohttp.ClientSession", return_value=fake_session):
 
         tasks = [asyncio.create_task(s._stream_feed(f)) for f in s.feeds]
-        await asyncio.sleep(1.0)
+        await _wait_until(lambda: (
+            len(s._gap_buffer.get("binance:BTCUSDT", [])) >= 1
+            and len(s._checksum_buffer.get("kraken:BTC/USD", [])) >= 1
+            and fake_session.get_calls >= 2
+        ))
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -202,7 +232,10 @@ async def _run_binance_futures_aux_connection(tmp_path):
             asyncio.create_task(s._stream_feed(feed)),
             asyncio.create_task(s._stream_aux_feed(feed)),
         ]
-        await asyncio.sleep(0.5)
+        await _wait_until(lambda: (
+            len(s._trade_buffer.get("binance_futures:BTCUSDT", [])) >= 1
+            and len(s._funding_buffer.get("binance_futures:BTCUSDT", [])) >= 1
+        ))
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -247,7 +280,12 @@ async def _run_bybit_linear_full_pipeline(tmp_path):
 
     with patch("crypto_lob_stream.streamer.websockets.connect", side_effect=fake_connect):
         task = asyncio.create_task(s._stream_feed(feed))
-        await asyncio.sleep(0.5)
+        key = "bybit_linear:BTCUSDT"
+        await _wait_until(lambda: (
+            len(s._funding_buffer.get(key, [])) >= 1
+            and len(s._liquidation_buffer.get(key, [])) >= 1
+            and len(s._open_interest_buffer.get(key, [])) >= 1
+        ))
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
@@ -318,7 +356,12 @@ async def _run_binance_futures_aux_and_oi_poll(tmp_path):
          patch("crypto_lob_stream.streamer.aiohttp.ClientSession", lambda: _FakeOISession()):
         aux_task = asyncio.create_task(s._stream_aux_feed(feed))
         poll_task = asyncio.create_task(s._poll_open_interest_loop(feed))
-        await asyncio.sleep(0.3)
+        key = "binance_futures:BTCUSDT"
+        await _wait_until(lambda: (
+            len(s._funding_buffer.get(key, [])) >= 1
+            and len(s._liquidation_buffer.get(key, [])) >= 1
+            and len(s._open_interest_buffer.get(key, [])) >= 1
+        ))
         aux_task.cancel()
         poll_task.cancel()
         await asyncio.gather(aux_task, poll_task, return_exceptions=True)
