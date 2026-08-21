@@ -188,11 +188,14 @@ All files are Snappy-compressed Parquet, flushed every 5 minutes by default (con
 
 ## Schemas
 
+Every table's `timestamp_ms` is local receive time; several also carry a separate, nullable `exchange_ts` — see "Timestamps" below for the distinction and why it matters.
+
 ### trades
 
 | Field | Type | Notes |
 |---|---|---|
-| timestamp_ms | int64 | Event time (Unix ms) |
+| timestamp_ms | int64 | Local receive time (Unix ms) — see "Timestamps" below |
+| exchange_ts | int64 (nullable) | The exchange's own event time, where provided — see "Timestamps" below |
 | exchange | string | e.g. `binance` |
 | asset | string | Native symbol, e.g. BTCUSDT |
 | trade_id | int64 | Exchange trade ID (UUID-based IDs are hashed to a stable int) |
@@ -204,7 +207,8 @@ All files are Snappy-compressed Parquet, flushed every 5 minutes by default (con
 
 | Field | Type | Notes |
 |---|---|---|
-| timestamp_ms | int64 | Event/receipt time (Unix ms) |
+| timestamp_ms | int64 | Local receive time (Unix ms) — see "Timestamps" below |
+| exchange_ts | int64 (nullable) | The exchange's own event time, where provided — see "Timestamps" below |
 | exchange | string | |
 | asset | string | |
 | side | string | bid or ask |
@@ -254,7 +258,8 @@ Matches are not written (that would be a row per update); only mismatches are pe
 
 | Field | Type | Notes |
 |---|---|---|
-| timestamp_ms | int64 | Event time (Unix ms) |
+| timestamp_ms | int64 | Local receive time (Unix ms) — see "Timestamps" below |
+| exchange_ts | int64 (nullable) | The exchange's own event time, where provided — see "Timestamps" below |
 | exchange | string | |
 | asset | string | |
 | mark_price | float64 | `None` for `okx_swap` — see "Known limitations" below |
@@ -265,7 +270,8 @@ Matches are not written (that would be a row per update); only mismatches are pe
 
 | Field | Type | Notes |
 |---|---|---|
-| timestamp_ms | int64 | Event time (Unix ms) |
+| timestamp_ms | int64 | Local receive time (Unix ms) — see "Timestamps" below |
+| exchange_ts | int64 (nullable) | The exchange's own event time, where provided — see "Timestamps" below |
 | exchange | string | |
 | asset | string | |
 | side | string | Side of the liquidated position |
@@ -278,13 +284,29 @@ Every row is a forced position closure — the most direct real-time signal of l
 
 | Field | Type | Notes |
 |---|---|---|
-| timestamp_ms | int64 | Event/poll time (Unix ms) |
+| timestamp_ms | int64 | Local receive/poll time (Unix ms) — see "Timestamps" below |
+| exchange_ts | int64 (nullable) | The exchange's own event time, where provided — see "Timestamps" below |
 | exchange | string | |
 | asset | string | |
 | open_interest | float64 | Total outstanding contracts/base currency |
 | open_interest_value | float64 | In quote currency (e.g. USD), where the exchange provides it. `None` for `binance_futures` — see "Known limitations" |
 
 Liquidations are the fire; open interest is the fuel — the two are meant to be read together for stress research, not separately.
+
+---
+
+## Timestamps: `timestamp_ms` vs `exchange_ts`
+
+Every trade, depth, funding, liquidation, and open-interest record carries two independent timestamps:
+
+- **`timestamp_ms`** — always this process's local receive time (or, for REST-polled data like `binance_futures` open interest, local parse time). Never populated from anything the exchange sends. Consistent across every exchange and record type, which makes it the right field to sort or join on when you need a single trustworthy clock across sources.
+- **`exchange_ts`** — the exchange's own event timestamp, kept separately, where the exchange actually provides one. Honestly `null` when it doesn't — never silently backfilled with local time, so a `null` here is a real signal ("this exchange/message didn't carry one"), not missing data.
+
+Keeping these separate — rather than blending them into one ambiguous `timestamp_ms`, as earlier versions of this package did for some record types — means `timestamp_ms` is reliable for ordering and joining across exchanges, while `exchange_ts` stays available for anything that specifically needs the exchange's own clock: cross-checking against exchange-side event logs, or measuring `timestamp_ms - exchange_ts` as an approximate per-exchange, per-message-type capture latency (network transit plus local processing) — a research angle this split makes newly possible.
+
+Coinbase and Kraken have no real exchange-assigned sequence number for `first_update_id`/`last_update_id`, so those two fields fall back to local receive time specifically when the exchange's own timestamp fails to parse — a separate, deliberate design choice from `exchange_ts`, which stays `null` in that same case rather than being backfilled. `first_update_id`/`last_update_id` need *some* usable ordering value on every row; `exchange_ts` doesn't carry that obligation.
+
+> **Note for users of pre-0.9.0 versions:** `timestamp_ms` semantics changed. Previously it was inconsistent — some record types on some exchanges (e.g. Binance trades) carried the exchange's own timestamp, others carried local receive time, with no way to tell which from the data alone. From 0.9.0 forward it's always local receive time, and `exchange_ts` is new. Data captured before this version may have `timestamp_ms` values that are actually exchange time for some exchange/record-type combinations — treat pre-0.9.0 `timestamp_ms` values with that in mind if precise local-vs-exchange timing matters for your analysis.
 
 ---
 
