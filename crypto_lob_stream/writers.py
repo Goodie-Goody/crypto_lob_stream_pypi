@@ -21,12 +21,32 @@ def write_local(records, schema, output_dir, prefix, exchange, asset, ts_str):
 
     Path: {output_dir}/{prefix}/{exchange}/{asset}/{ts_str}.parquet
     Creates directories as needed.
+
+    Refuses to silently overwrite an existing file at that exact path --
+    this should never happen with a correctly unique ts_str, but "should
+    never happen" is exactly what the previous hour-only ts_str bug also
+    looked like right up until it silently destroyed most of a hundred+
+    million rows across the project's whole history. If it ever does
+    happen (clock issue, a future regression, anything), this logs loudly
+    and disambiguates instead of destroying data quietly.
     """
     if not records:
         return True
 
     out_path = Path(output_dir) / prefix / exchange / asset / f"{ts_str}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists():
+        logger.error(
+            f"COLLISION: {out_path} already exists and would have been "
+            f"silently overwritten. This should never happen with a "
+            f"correctly unique ts_str -- writing to a disambiguated path "
+            f"instead so nothing is lost, but this is worth investigating."
+        )
+        n = 1
+        while out_path.exists():
+            out_path = out_path.with_name(f"{ts_str}_dup{n}.parquet")
+            n += 1
 
     try:
         table = pa.Table.from_pylist(records, schema=schema)
@@ -46,6 +66,17 @@ def write_gcs(records, schema, bucket_name, prefix, exchange, asset, ts_str, fal
     Blob path: {prefix}/{exchange}/{asset}/{ts_str}.parquet
     Records are never silently dropped: if all GCS retries fail and a
     fallback_dir is provided, the Parquet file is saved there instead.
+
+    Uploads with if_generation_match=0, meaning the write only succeeds
+    if no object already exists at that exact blob path -- this should
+    always be true with a correctly unique ts_str, but makes the
+    overwrite-safety guarantee atomic and free (the same billed
+    operation either way) rather than requiring a separate existence
+    check beforehand, which would both cost an extra operation per flush
+    and leave a race window between checking and writing. If the
+    precondition fails (something's already there), this logs loudly and
+    retries once with a disambiguated path instead of silently
+    overwriting.
     """
     if not records:
         return True
@@ -73,14 +104,35 @@ def write_gcs(records, schema, bucket_name, prefix, exchange, asset, ts_str, fal
             "Install it with: pip install crypto-lob-stream[gcs]"
         )
 
+    def _is_precondition_failure(exc) -> bool:
+        # google-cloud-storage raises google.api_core.exceptions.PreconditionFailed
+        # (HTTP 412) when if_generation_match's condition isn't met. Checked
+        # defensively by status code/message rather than importing the
+        # exact exception class, since different google-cloud-storage
+        # versions have moved this around before.
+        code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        return code == 412 or "412" in str(exc) or "conditionNotMet" in str(exc)
+
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         try:
             client = gcs.Client()
-            client.bucket(bucket_name).blob(blob_path).upload_from_filename(tmp_path)
+            client.bucket(bucket_name).blob(blob_path).upload_from_filename(
+                tmp_path, if_generation_match=0,
+            )
             logger.info(f"Uploaded {len(records):,} records -> gs://{bucket_name}/{blob_path}")
             os.remove(tmp_path)
             return True
         except Exception as e:
+            if _is_precondition_failure(e):
+                logger.error(
+                    f"COLLISION: gs://{bucket_name}/{blob_path} already exists "
+                    f"and would have been silently overwritten. This should "
+                    f"never happen with a correctly unique ts_str -- uploading "
+                    f"to a disambiguated path instead, but this is worth "
+                    f"investigating."
+                )
+                blob_path = f"{prefix}/{exchange}/{asset}/{ts_str}_dup.parquet"
+                continue
             logger.warning(f"GCS attempt {attempt}/{MAX_RETRY_ATTEMPTS} failed for {blob_path}: {e}")
             if attempt < MAX_RETRY_ATTEMPTS:
                 time.sleep(2 ** attempt)

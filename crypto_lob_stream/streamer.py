@@ -474,7 +474,18 @@ class LOBStreamer:
         if not force and (now - self._last_flush) < self.flush_interval:
             return
 
-        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
+        # Full timestamp precision, not just the hour -- _heartbeat() calls
+        # this every flush_interval seconds for the life of the process, so
+        # an hour-only ts_str meant every flush within the same hour wrote
+        # to the identical filename/blob path. write_local/write_gcs both
+        # do a plain overwrite (no append), so each subsequent flush that
+        # hour silently destroyed the previous one's data -- confirmed via
+        # direct reproduction: two flushes seconds apart left only the
+        # second one's record on disk. At the default flush_interval=300,
+        # this meant only the last 5 minutes of every hour was ever
+        # actually retained. Matches the precision snapshot writes already
+        # correctly used (see _fetch_snapshot above).
+        ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M%S")
         flush_time = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
         counts: dict = defaultdict(lambda: defaultdict(int))
