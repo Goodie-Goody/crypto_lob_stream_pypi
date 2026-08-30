@@ -428,6 +428,61 @@ def test_ingest_open_interest_record():
     assert oi[0]["open_interest_value"] is None
 
 
+def test_consecutive_flushes_within_same_hour_do_not_overwrite_each_other(tmp_path):
+    """Regression test: _flush() previously named output files with only
+    hour-level precision ("%Y-%m-%d-%H"), while _heartbeat() calls
+    _flush() every flush_interval seconds for the life of the process --
+    with any flush_interval under an hour (the default is 300s), every
+    flush after the first within the same clock hour silently overwrote
+    the previous one's file, since write_local/write_gcs both do a plain
+    overwrite, not an append. Confirmed via direct reproduction before
+    the fix: two flushes moments apart left only the second one's record
+    on disk, with no error or warning anywhere. Now uses full
+    second-level precision, matching what snapshot writes already
+    correctly used."""
+    import time
+    from unittest.mock import patch
+    from datetime import datetime, timezone
+
+    s = LOBStreamer(exchange="binance", assets=["BTCUSDT"], output="local",
+                     output_dir=str(tmp_path), flush_interval=60)
+
+    # Two distinct, real seconds -- mocking datetime.now() rather than
+    # sleeping keeps this test fast while still proving the fix handles
+    # genuinely different flush timestamps, not just an artifact of two
+    # calls landing in the same wall-clock second.
+    t1 = datetime(2026, 8, 30, 13, 10, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 8, 30, 13, 10, 1, tzinfo=timezone.utc)  # same HOUR, different second
+
+    with patch("crypto_lob_stream.streamer.datetime") as mock_dt:
+        mock_dt.now.return_value = t1
+        s._trade_buffer["binance:BTCUSDT"] = [{
+            "timestamp_ms": 1, "exchange_ts": 1, "exchange": "binance", "asset": "BTCUSDT",
+            "trade_id": 1, "price": 100.0, "quantity": 1.0, "buyer_maker": True,
+        }]
+        s._flush(force=True)
+
+        mock_dt.now.return_value = t2
+        s._trade_buffer["binance:BTCUSDT"] = [{
+            "timestamp_ms": 2, "exchange_ts": 2, "exchange": "binance", "asset": "BTCUSDT",
+            "trade_id": 2, "price": 101.0, "quantity": 1.0, "buyer_maker": False,
+        }]
+        s._flush(force=True)
+
+    import pyarrow.parquet as pq
+    path = tmp_path / "trades" / "binance" / "BTCUSDT"
+    files = sorted(path.glob("*.parquet"))
+    assert len(files) == 2, f"expected 2 distinct files (same hour, different second), got {len(files)}"
+
+    all_trade_ids = []
+    for f in files:
+        all_trade_ids.extend(r["trade_id"] for r in pq.read_table(str(f)).to_pylist())
+    assert sorted(all_trade_ids) == [1, 2], (
+        "both flushes' data must survive -- if this fails with only [2], "
+        "the overwrite bug has regressed"
+    )
+
+
 def test_liquidation_and_open_interest_flush_to_parquet(tmp_path):
     s = LOBStreamer(exchange="bybit_linear", assets=["BTCUSDT"], output="local",
                      output_dir=str(tmp_path), flush_interval=9999)
