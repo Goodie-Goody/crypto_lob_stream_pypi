@@ -12,7 +12,7 @@ I experienced it as well, which is where the motivation to build this came from.
 
 The focus on crypto is due to its unique exception compared to other asset classes: the major crypto exchanges publish full L2 order book and trade data over free, public WebSocket feeds. This package puts a single, consistent interface in front of several of them, so anyone can collect continuous, fully reconstructable order book data with one command (or several, concurrently, in one process) and store it in an open format. The goal is simple: lower the data barrier for high-frequency and market-microstructure research, at least in the one asset class where the raw feeds are genuinely open.
 
-As a contribution back to the community, monthly snapshots of BTC, ETH, and SOL order book data (collected from Binance) are published freely on [Hugging Face](https://huggingface.co/).
+As a contribution back to the community, monthly snapshots of order book, trade, and futures data across all supported exchanges are published freely on [Hugging Face](https://huggingface.co/).
 
 ---
 
@@ -164,25 +164,41 @@ streamer = LOBStreamer(
 streamer.run()
 ```
 
+### Auditing captured data for coverage gaps
+
+Separate from the two live checks above, `audit_coverage()` inspects Parquet files already on disk and flags hours whose data looks suspiciously thin relative to the file's intended time window — the signature left behind by, for example, two writes colliding on the same output path (fixed in 0.9.2; see "Known limitations" below and the [0.9.2 release notes](https://github.com/Goodie-Goody/crypto_lob_stream_pypi/releases/tag/v0.9.2) for the full story). Useful both as a one-time check on older data and as an ongoing spot-check against future regressions of the same shape.
+
+```python
+from crypto_lob_stream import audit_coverage, summarize
+
+# window_seconds must match what a healthy file is actually expected to
+# cover: 3600 for raw hour-named files, or your compact() granularity in
+# seconds for already-compacted files (86400 for "day", etc.)
+results = audit_coverage("./lob_data/trades/binance/BTCUSDT", window_seconds=3600)
+print(summarize(results))
+```
+
 ---
 
 ## Output structure
 
 ```
 {output_dir}/
-  trades/{exchange}/{asset}/YYYY-MM-DD-HH.parquet
-  depth/{exchange}/{asset}/YYYY-MM-DD-HH.parquet
-  snapshots/{exchange}/{asset}/YYYY-MM-DD-HHmmss.parquet
-  gaps/{exchange}/{asset}/YYYY-MM-DD-HH.parquet            # only written when a gap is detected
-  checksums/{exchange}/{asset}/YYYY-MM-DD-HH.parquet       # only written on a mismatch
-  funding/{exchange}/{asset}/YYYY-MM-DD-HH.parquet         # futures/perps only
-  liquidations/{exchange}/{asset}/YYYY-MM-DD-HH.parquet    # futures/perps only
-  open_interest/{exchange}/{asset}/YYYY-MM-DD-HH.parquet   # futures/perps only
+  trades/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet
+  depth/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet
+  snapshots/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet
+  gaps/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet            # only written when a gap is detected
+  checksums/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet       # only written on a mismatch
+  funding/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet         # futures/perps only
+  liquidations/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet    # futures/perps only
+  open_interest/{exchange}/{asset}/YYYY-MM-DD-HHMMSS.parquet   # futures/perps only
 ```
 
 All files are Snappy-compressed Parquet, flushed every 5 minutes by default (configurable with `--flush-interval`). Output is always partitioned by exchange first, then asset, so running multiple exchanges never collides, even for the same symbol on two different exchanges.
 
 > **Note for users of pre-0.7.0 versions:** every Parquet table now carries an explicit `exchange` column, and paths are nested one level deeper (`{prefix}/{exchange}/{asset}/...` instead of `{prefix}/{asset}/...`). Existing data will sit alongside the new layout rather than merge into it — move it under an `{exchange}/` subfolder manually if you want one unified tree.
+
+> **Note for users of pre-0.9.2 versions:** filenames changed from hour precision (`YYYY-MM-DD-HH.parquet`) to full second precision (`YYYY-MM-DD-HHMMSS.parquet`) for every table except `snapshots` (which already used second precision). This fixes a real issue where multiple flushes within the same hour could silently overwrite one another — see "Known limitations" below and the [0.9.2 release notes](https://github.com/Goodie-Goody/crypto_lob_stream_pypi/releases/tag/v0.9.2) for the full explanation. Existing pre-0.9.2 files aren't renamed automatically; new files simply use the corrected format going forward.
 
 ---
 
@@ -377,7 +393,31 @@ compact("lob_data/depth/binance/BTCUSDT",
 compact_tree("lob_data", "lob_data_compacted", granularity="month")
 ```
 
-`granularity` is `"day"`, `"week"`, `"month"`, or `"year"` — pick whatever matches how you'll actually query the data later. Pass `delete_source=True` once you trust the result, to remove the small originals after merging; it defaults to `False` so the first run is non-destructive.
+`granularity` is `"day"`, `"week"`, `"month"`, or `"year"` — pick whatever matches how you'll actually query the data later. Pass `delete_source=True` once you trust the result, to remove the small originals after merging; it defaults to `False` so the first run is non-destructive. `compact()`/`compact_tree()` tolerate a bucket spanning a schema change (e.g. a field added in a newer package version) by filling the missing column with `null` in the older rows, rather than raising.
+
+---
+
+## Auditing existing data for coverage gaps
+
+Version 0.9.2 fixed a bug where, at any `flush_interval` under 3600 seconds (the default is 300), files named with hour-only precision could get silently overwritten by a later flush within the same hour — see the [0.9.2 release notes](https://github.com/Goodie-Goody/crypto_lob_stream_pypi/releases/tag/v0.9.2) for the full explanation. `audit_coverage()` checks existing captured files for the timestamp-clustering signature that bug leaves behind: real data spread thin across a whole hour looks very different from a burst crammed into a few minutes with silence either side.
+
+```python
+from crypto_lob_stream import audit_coverage, summarize
+
+# Point this at a single (prefix, exchange, asset) leaf, or a whole tree
+results = audit_coverage("./lob_data/trades/binance/BTCUSDT", window_seconds=3600)
+print(summarize(results))
+```
+
+`window_seconds` must match what a healthy file is actually expected to cover, or this produces noisy, meaningless results:
+
+- **Raw, uncompacted files** (one file per `flush_interval`, the default output shape): pass `flush_interval` itself, e.g. `60` — each file only ever covers one flush's worth of time by design, so comparing it against a full hour will flag almost everything as suspicious even when nothing is wrong.
+- **Compacted files** (after `compact()`/`compact_tree()`, one file per day/week/month/year bucket): pass that granularity in seconds, e.g. `86400` for `"day"` — these genuinely are expected to span close to their full bucket.
+- **Legacy hour-named files from before 0.9.2**: the default `3600` is exactly right — this is what the tool was originally built to check.
+
+`snapshots/` files are a special case worth knowing about: a snapshot is captured once per WebSocket connection, not spread continuously through an hour, so `audit_coverage()` will flag even a perfectly healthy snapshot file as "narrow" if pointed at it directly. Exclude `snapshots/` paths from this check entirely rather than trying to interpret its results there.
+
+Useful both as a one-time check on older data and as an ongoing spot-check against future regressions of the same shape.
 
 ---
 
@@ -419,6 +459,7 @@ Config is saved to `~/.crypto_lob_stream/config.json`, so credentials apply auto
 ## Known limitations
 
 - Binance depth files collected before **2026-06-03 14:38:49 UTC** do not contain sequence ids and cannot be used for full reconstruction.
+- Files written before **package version 0.9.2** may have coverage gaps in some hours, due to a filename-collision issue that has since been fixed (unique per-second filenames plus a collision guard on every write). See the [0.9.2 release notes](https://github.com/Goodie-Goody/crypto_lob_stream_pypi/releases/tag/v0.9.2) for the full explanation, and `audit_coverage()` (see "Data integrity" above) to check your own older data.
 - `okx_swap` funding records have `mark_price=None` by design — a real value requires also subscribing to OKX's separate `mark-price` channel, which isn't wired up yet.
 - `binance_futures` open-interest records have `open_interest_value=None` — Binance's REST endpoint provides a contract count but not a USD value (OKX and Bybit linear both provide one, since their open-interest data already carries it).
 - OKX swap's `open-interest` channel payload fields (`oi`, `oiUsd`) are assumed to mirror OKX's confirmed REST response shape, per OKX's general consistency between REST and WS field naming — the WS push itself wasn't separately confirmed against a live connection. If `oiUsd` is ever absent in practice, `open_interest_value` will just come through as `None` rather than raising, but this is one to watch on first live run.
@@ -435,7 +476,7 @@ Config is saved to `~/.crypto_lob_stream/config.json`, so credentials apply auto
 
 ## Hugging Face dataset
 
-Monthly snapshots of BTC, ETH, and SOL order book and trade data, collected from Binance with this package, are published freely on Hugging Face as a contribution to the open-source research community. Multi-exchange dataset releases are planned.
+Monthly snapshots of order book, trade, and (for perpetual futures venues) funding, liquidation, and open-interest data — across all eight supported exchanges — are published freely on Hugging Face as a contribution to the open-source research community. See the dataset card for current coverage and known limitations.
 
 ---
 
